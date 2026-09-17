@@ -56,8 +56,8 @@ def test_member_id():
 def test_email_col():
     show("email_col", 1, [
         ["name", "email"],
-        ["a", "a@x.com"],
-        ["b", "b@x.com"],
+        ["a", "a@example.com"],
+        ["b", "b@example.com"],
     ])
 
 
@@ -129,8 +129,8 @@ def test_url_col():
 def test_phone_col():
     show("phone_col", 1, [
         ["姓名", "手机号"],
-        ["张三", "13800138000"],
-        ["李四", "13900139000"],
+        ["张三", "13000000000"],
+        ["李四", "13000000001"],
     ])
 
 
