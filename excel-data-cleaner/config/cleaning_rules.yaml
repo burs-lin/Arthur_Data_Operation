@@ -1,0 +1,155 @@
+# excel-data-cleaner 默认规则配置
+# 字段识别基于列名关键词启发式;可按需扩展或覆盖
+
+fields:
+  id:
+    column_keywords:
+      - id
+      - 编号
+      - no
+      - code
+      - key
+      - uuid
+      - 工号
+      - 订单号
+      - 流水号
+      - 单号
+      - 票号
+      - 号           # 兜底:任何含"号"字的列名都视作 ID 类
+    cell_format: "@"               # 文本格式,避免科学计数法
+    is_primary_key: true
+
+  datetime:
+    column_keywords:
+      - datetime
+      - timestamp
+      - date
+      - time
+      - 日期
+      - 时间
+      - _dt
+      - _ts
+    output_format: "YYYY-MM-DD"
+    cell_format: "yyyy-mm-dd"
+    force_24h: true                # 12h 制 AM/PM 自动转 24h
+
+  month:
+    column_keywords: [付款月份, 交易月份, month]
+    output_format: "YYYY-MM"
+    cell_format: "yyyy-mm"
+
+  long_text:
+    column_keywords:
+      [desc, remark, 备注, 说明, comment, address, 地址, note, notes]
+    max_length: 500                # 超过则截断并追加 [TEXT_TOO_LONG]
+    strip_only: true               # 只 strip 首尾空白,保留段落内空行/空格
+
+  # 百分比列:列名含"费率/比例/占比/折算比例/折扣/费率折扣/使用比"等的字段,
+  # 默认 cell_format 用 0.00%(不影响底层值,只改显示)。
+  # 注意:必须在 amount 之前,否则 amount.gmv 会抢先命中"结汇GMV占比"
+  percent:
+    column_keywords:
+      - 费率
+      - 比例
+      - 占比
+      - 折算比例
+      - 折扣
+      - 费率折扣
+      - 使用比
+      - gmv比
+      - percentage
+      - rate
+      # 更长的关键词,优先于 amount 中的 "gmv"
+      - gmv占比
+    cell_format: "0.00%"
+    allow_negative: false
+    # 数值上限/下限校验(防止异常离群)
+    min_value: 0
+    max_value: 1  # 默认认为是 0~1 的小数比例;若实际是 0~100 的整数百分比,请在调用前手动调整
+
+  amount:
+    column_keywords: [amount, money, price, 金额, 价格, fee, cost, salary, revenue, income, gmv, 比例费金额, 手续费, 调整金额, 成本, 利润, 余额, balance]
+    cell_format: "0.00"
+    allow_negative: true
+
+  number:
+    column_keywords: [count, qty, quantity, 数量, age, score, ratio, 月份数, 次数]
+    cell_format: "0.00"
+
+  phone:
+    column_keywords: [phone, mobile, 手机, tel]
+    cell_format: "@"
+    regex_cn: "^\\d{11}$"
+
+  email:
+    column_keywords: [email, 邮箱, mail]
+    cell_format: "@"
+    regex: "^[\\w.+-]+@[\\w-]+\\.[\\w.-]+$"
+    lowercase: true                # 邮箱统一小写
+
+  boolean:
+    column_keywords: [is_, flag, enabled, 是否, active]
+    cell_format: "@"
+
+empty_values:
+  literals:
+    - ""
+    - " "
+    - "  "
+    - "\t"
+    - "\n"
+    - "null"
+    - "NULL"
+    - "None"
+    - "N/A"
+    - "n/a"
+    - "NA"
+    - "-"
+    - "—"
+    - "--"
+    - "#N/A"
+    - "\\N"
+
+# 字符串归一(全表所有字符串先经过这里)
+string_normalize:
+  unicode_nfkc: true              # 全角→半角、不间断空格归一
+  trim: true                      # 字段值首尾去空白
+  strip_internal_whitespace: false  # 文本字段不清除内部空白
+  collapse_internal_whitespace: false  # 不合并段落内空白
+  lowercase_email: true
+  lowercase_untyped_text: false
+
+anomalies:
+  future_date_tolerance_days: 1   # 允许 1 天未来日期缓冲
+  min_date: "1970-01-01"
+  out_of_range_abs: 1e12          # 数值越界阈值
+  email_regex: "^[\\w.+-]+@[\\w-]+\\.[\\w.-]+$"
+  phone_regex_cn: "^\\d{11}$"
+  stat_outlier_std_multiplier: 2  # 数值列 Mean ± N*Std 视为异常
+  stat_outlier_min_samples: 10    # 样本数低于该值不做统计学判定
+
+# 输出样式(应用在所有 sheet)
+output_style:
+  font_name: "微软雅黑"
+  font_size: 9
+  font_color: "FF000000"          # 黑色
+  border_color: "FF000000"        # 黑色细边框
+  border_style: "thin"
+  header_fill: "FFD9E1F2"         # 表头浅蓝底色
+  header_bold: true
+
+output:
+  format: xlsx                    # 默认输出 xlsx(.xlsm 自动切到 xlsm)
+  report_sheet: _CLEAN_REPORT
+  anomalies_sheet: _ANOMALIES
+  suffix_pattern: "{stem}_cleaned.xlsx"
+
+# .xlsm 宏文件处理
+vba:
+  preserve: auto                  # auto / true / false
+                                  # auto:输入是 .xlsm 时自动保留,否则不保留
+                                  # true: 强制保留(输出必须是 .xlsm)
+                                  # false: 强制不保留
+  preserve_other_sheets: true     # 是否保留 .xlsm 中的其他 sheet
+  delete_rows_before_write: true  # 写数据前清空原 sheet 的数据行
+                                  # (保留 sheet 名,以防宏引用)

@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 测试运行中间产物(避免把大体积的 *_out.xlsx 推进仓库)
+tests/_tmp/
+tests/*_out.xlsx
+tests/*_out.xlsm
+tests/*_out.csv
+pytest_cache/
+.coverage
+htmlcov/
+
+# 临时清洗产物
+examples/*_cleaned.xlsx
+examples/*_cleaned.xlsm
+examples/*_cleaned_novba.xlsx
+examples/*_summary_cleaned.xlsm
+examples/*_test*.csv
+examples/*_test*.xlsx
+examples/sample_merge_*.csv
+examples/sample_merge_*.xlsx
+examples/sample_style_test*.csv
+examples/sample_style_test*.xlsx
+
+# 临时调试文件
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 日志与缓存(可选:若希望保留 logs/ 记录版本演进,请删除下行)
+# logs/
+
+# 环境变量
+.env
+.env.local
