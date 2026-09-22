@@ -1,0 +1,86 @@
+# keywords.yaml
+# v3.2 可配置的列表头关键字、阈值与颜色
+
+# 达成率/通过率/完成率类列表头（命中后添加黄色 Data Bar + 0.00% 格式）
+rate_keywords:
+  - 达成率
+  - 通过率
+  - 完成率
+  - 完成比
+  - 达标率
+
+# 环比/同比类列表头（命中后添加红色 Data Bar + 上中下箭头着色 + 0.00% 格式）
+momyoy_keywords:
+  - 环比
+  - MoM
+  - mom
+  - ring
+  - 同比
+  - YoY
+  - yoy
+  - year-over-year
+
+# 金额类列表头（命中后添加 ¥ 货币符号并居右）
+money_keywords:
+  - 金额
+  - 销售额
+  - 营收
+  - 收入
+  - 支出
+  - 利润
+  - GMV
+  - gmv
+  - 成交额
+  - 回款
+  - 客单价
+  - 定价
+
+# 表头/合计行关键字（命中后该行加粗；横向合并单元格所在行也加粗）
+header_keywords:
+  - 合计
+  - 总计
+  - 小计
+  - 表头
+  - 汇总
+
+# 数字格式化阈值
+# v3.3 起：列均值 >= wan_threshold 时启用万级缩放
+#   底层值 / 10000 + 格式 '0.0"万"'（字面量"万"）
+# 注：CLI 参数 --no-wan 可禁用此行为
+wan_threshold: 10000
+wan_enabled: true
+
+# 率/通过率/完成率/环比/同比的百分比格式（Excel number_format，底层值不动）
+percent_format: "0.00%"
+
+# 内容区空值处理（v3.1 起分区处理）
+empty_fill_value: "-"
+
+# 列宽自适应（v3.2 起）
+column_width:
+  min: 8       # 最小列宽
+  max: 30      # 最大列宽（超出则 wrap 到 2 行）
+  wrap_row_height: 30  # wrap 行高
+
+# 颜色配置
+colors:
+  yellow_bar: "FFFFD966"
+  yellow_text: "FFB300"
+  red_bar: "FFE06666"
+  red_text: "FF0000"
+  green_bar: "FF93C47D"
+  green_text: "00B050"
+  border: "FF000000"
+
+# 字体与字号
+font:
+  family: "微软雅黑"
+  size: 9
+
+# 表头日期格式（YY年MM月）
+date_format: "YY年MM月"
+
+# 表头/内容定位最大扩展行数
+layout:
+  max_title_rows: 3
+  max_title_cols: 3
