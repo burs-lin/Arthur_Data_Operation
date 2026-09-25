@@ -5,8 +5,8 @@
 import sys, subprocess, openpyxl, os
 from pathlib import Path
 
-SKILL = Path(__file__).resolve().parent.parent  # 同级 skills/ 的当前 skill 根目录
-RES = SKILL / "resources"
+SKILL = Path(__file__).resolve().parent.parent  # 当前 skill 根目录（同级 scripts/）
+RES = SKILL / "scripts"
 sys.path.insert(0, str(RES))
 
 def make_input(fmt_cases, n_data_rows=5):

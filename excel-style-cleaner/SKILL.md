@@ -42,8 +42,8 @@ description: >
 本 skill 对任意 `.csv / .xls / .xlsx / .xlsm` 文件执行**四阶段规范化处理**，产出一份"视觉一致、可直接展示"的看板 / 汇总报表。
 
 **底层实现**：
-- `resources/excel_style_cleaner.py` — **openpyxl 引擎**（默认；保留原 sheet 结构、合并、批注）
-- `resources/excel_writer.py` — **xlsxwriter 引擎**（`--xwriter` 模式；纯写新表；性能更好）
+- `scripts/excel_style_cleaner.py` — **openpyxl 引擎**（默认；保留原 sheet 结构、合并、批注）
+- `scripts/excel_writer.py` — **xlsxwriter 引擎**（`--xwriter` 模式；纯写新表；性能更好）
 
 两套引擎共享同一套样式规则（关键字、数字格式、颜色、列宽）。CLI 主入口 `excel_style_cleaner.py` 已接通 `--xwriter` 等 13 个参数。
 
@@ -534,7 +534,7 @@ MOMYOY_KEYWORDS = MOM_KEYWORDS + YOY_KEYWORDS + ["同比环比", "环比同比",
 
 ```powershell
 # openpyxl 版（默认）—— 清洗旧表
-python "<PROJECT_ROOT>/.agents/skills/excel-style-cleaner/resources/excel_style_cleaner.py" "<input_path>" [-o <output_path>]
+python "<PROJECT_ROOT>/.agents/skills/excel-style-cleaner/scripts/excel_style_cleaner.py" "<input_path>" [-o <output_path>]
 
 # xwriter 版 —— 纯写新表（性能更好，BI 导出场景）
 python "...excel_style_cleaner.py" "<input_path>" --xwriter
@@ -641,13 +641,13 @@ write_multi_sheet_xlsx(
 | `PERCENT_NO_BAR_KEYWORDS` 关键字 | 5 个（v3.46+） | 包含"分润率/费率/汇率/分佣率/折算率"；避免误判为普通列（无关键字命中 percent 判定） |
 | `RATE_KEYWORDS` 含"留存率" | 加入（v3.46+） | "col_<biz_alias_2>..."含"留存率"被 `is_rate_column` 命中 → 走 percent 而非 GMV 万级 |
 | `fill_empty_content_cells` 异常处理 | try-except 静默（v3.48+） | Phase 2 后跑时遇到合并副格写值会抛 AttributeError；加 try-except 静默跳过 |
-| 竖向合并延伸判定 | 空/占位/与源格同值（v3.49+） | Phase 2 竖向合 next_val 允许 `is_value_for_merge` 或 `_can_extend_for_repeat_value`；支持重复值竖向合并（sheet"sheet_1_2" B2:B6 + B8:B16 + B17:B21） |
+| 竖向合并延伸判定 | 空/占位/与源格同值（v3.49+） | Phase 2 竖向合 next_val 允许 `is_value_for_merge` 或 `_can_extend_for_repeat_value`；支持重复值竖向合并（sheet"1.2" B2:B6 + B8:B16 + B17:B21） |
 | Phase 1 表头行竖向合禁用重复值延伸 | 仅占位/空（v3.50+） | Phase 1 表头行源格（header_row ∈ header_rows）走竖向合时，禁止 `_can_extend_for_repeat_value` 延伸；防止 v3.49 在 sheet"2" R2 D2:D3 触发"重复值竖向合"→ D2 横合 D2:AS2 被 vertical_merged_cols 跳过 → merge_header_rectangles 扩展成 D2:Q3 越界 |
-| Phase 2 列表头跳过数据行源格 | r ∈ header_rows 才处理（v3.50+），col=1 例外（v3.51+） | Phase 2 处理 header_col 时跳过 `r not in header_rows_set` 的源格；例外 col=1（A 列）不跳过——A 列是"行维度列"，整列所有行都是 header_cells 源格；防止 sheet"sheet_1_2" R7 B7='付款GMV'（数据行的"行维度标签"）被当作表头源格处理 → B7:C7 横合（C7 是数据）|
+| Phase 2 列表头跳过数据行源格 | r ∈ header_rows 才处理（v3.50+），col=1 例外（v3.51+） | Phase 2 处理 header_col 时跳过 `r not in header_rows_set` 的源格；例外 col=1（A 列）不跳过——A 列是"行维度列"，整列所有行都是 header_cells 源格；防止 sheet"1.2" R7 B7='付款GMV'（数据行的"行维度标签"）被当作表头源格处理 → B7:C7 横合（C7 是数据）|
 | Phase 2.5 跳过 A 列有标签的数据行 | A列真值 == cell_val 时跳过 c≠1 源格（v3.53+ 同 v3.52 语义） | Phase 2.5 处理数据行源格时，如果该行 A 列真值 == cell_val（同值），跳过 c≠1 的源格横向合；让 Phase 2 统一处理 A 列展开（A 列真值 != cell_val 时不跳过，如 R13 A13='<region_B>' B13='<region_sub>' 不同值，Phase 2.5 应当合 B13:C13；A 列是合并副格/占位时也不跳过）|
 | Phase 1 行表头处理顺序 | 先横后竖（v3.53+） | v3.22+ 改为"先横后竖"——避免 R2 D2:D3 重复值竖向合冲突 D2:AS2 横合；行内扩展优先 → 先确定列范围再确定行范围 |
 | Phase 2 列表头处理顺序 | 先横后竖（v3.53+，保留）| 列内扩展优先 → 按列号升序，每列内先横向合再竖向合 |
-| Phase 2 占位跨 header_cols 边界 | col≥2 且 r∉header_rows 禁止占位跨边界（v3.53+） | 仅 `a_col_has_label=True 且 header_col=1` 时允许占位延伸；防止 sheet"sheet_1_2" R7 B7='付款GMV'（col=2）+ C7='-' → 不再合 B7:C7（C 列不在 header_cols）|
+| Phase 2 占位跨 header_cols 边界 | col≥2 且 r∉header_rows 禁止占位跨边界（v3.53+） | 仅 `a_col_has_label=True 且 header_col=1` 时允许占位延伸；防止 sheet"1.2" R7 B7='付款GMV'（col=2）+ C7='-' → 不再合 B7:C7（C 列不在 header_cols）|
 | merge_header_rectangles 独立合并干扰 | is_in_other_merge 排除嵌套合并（v3.53+） | 排除"以 exclude_merge 源格为左上角的合并"（如 A1:C1 + A1:A4 嵌套，不算独立合并），避免误阻断横向合向下扩展 |
 | merge_header_rectangles 重叠 unmerge | unmerge 所有与新范围重叠的其他 merge（v3.53+） | 防止 openpyxl 在 merge A1:C4 时产生 A1:A4 + A1:C4 两个独立 merge 的 bug |
 | apply_number_formats 行级覆盖 | B列指标标签命中 INTEGER_COUNT_KEYWORDS 覆盖列级格式（v3.54+） | 在 cell 循环里读 B 列（指标列 = max(header_cols)）的标签；若命中关键字该 cell 走整数 `#,##0`；覆盖列级"万级/普通"判定 |
@@ -673,7 +673,7 @@ write_multi_sheet_xlsx(
 
 ## 扩展定制
 
-修改 `resources/excel_style_cleaner.py` 顶部常量：
+修改 `scripts/excel_style_cleaner.py` 顶部常量：
 
 ```python
 RATE_KEYWORDS = [...]      # 达成率/通过率/完成率类列标题关键字
@@ -696,8 +696,8 @@ TITLE_KEYWORDS = [...]     # 标题/合计行关键字
 
 | 资源 | 路径 | 用途 | 何时加载 |
 |------|------|------|---------|
-| 主清洗脚本（openpyxl 版） | `resources/excel_style_cleaner.py` | 读取并清洗旧表 | 每次调用必读 |
-| 新表写入（xlsxwriter 版） | `resources/excel_writer.py` | 纯写新表，BI / 批量出表 | `--xwriter` 时必读 |
+| 主清洗脚本（openpyxl 版） | `scripts/excel_style_cleaner.py` | 读取并清洗旧表 | 每次调用必读 |
+| 新表写入（xlsxwriter 版） | `scripts/excel_writer.py` | 纯写新表，BI / 批量出表 | `--xwriter` 时必读 |
 | 端到端测试（v3.17 自检） | `references/_test_v317.py` | 验证 6 类格式自检 | 修改 v3.17 后必跑 |
 | 端到端测试（基础） | `references/smoke_test.md` | 验证脚本可用性 | 修改后必跑 |
 | 配置样例 | `config/keywords.yaml` | 关键字与颜色可配置化 | 二次定制时参考 |
@@ -707,56 +707,23 @@ TITLE_KEYWORDS = [...]     # 标题/合计行关键字
 
 ## 版本变更
 
-> **所有版本变更记录已迁移至 `logs/log.md`**。本节仅列出版本概览索引。
+> **所有版本变更记录在 [`logs/log.md`](computer://<PROJECT_ROOT>\.agents\skills\excel-style-cleaner\logs\log.md)**。本节仅提供索引摘要。
 
-- **v3.54 (2026-09-20)**：用户反馈 sheet"sheet_1_2 col_<biz_alias_5>行使用 0.0万 格式"+"均值非≥1万的数字列若整列都是整数则用整数格式"。重设 apply_number_formats 的 cell 循环：① 新增 `_column_all_integer` 辅助函数——判定列是否所有非空数字 cell 都是整数；② 优先级 5 普通数字列判定：均值 < 1万 + 整列整数 → 走整数格式 `#,##0`，否则 `#,##0.00`；③ 新增**行级指标标签覆盖列级格式**：在 cell 循环里读 B 列（指标列 = max(header_cols)）的标签——若命中 INTEGER_COUNT_KEYWORDS（客户数/会员数/账号数/订单数/链接数/代理商数/合同数/人数），该 cell 走整数格式（覆盖列级"万级/普通"判定）。
-  - 例：sheet"sheet_1_2" R17 B17='col_<biz_alias_5>'（label）→ C17~O17 走整数（而非整列"0.0万"）
-  - 例：sheet"4" col 171 R2='col_<biz_alias_3>' → R4=656 走整数 `#,##0`
-  - 例：sheet"4" col 185 R2='col_<biz_alias_4>' → R4=3096 走整数 `#,##0`
-  - 列级 `is_integer_count_column(last_header)` 判定**不依赖 all_layers**——避免 R2='45809'(日期)+all_layers 含 'col_<biz_alias_5>' 时把整列误判为整数（导致 GMV 数据走整数格式）
-- **v3.53 (2026-09-17)**：用户反馈"行表头处理应该先横后竖，列表头处理先竖后横"，并指出 Phase 2.5 不是冗余（处理"漏检的行维度列"）。重设计：① Phase 1 改为**先横后竖**——避免 R2 D2:D3 重复值竖向合冲突 D2:AS2 横合；② Phase 2 占位跨 header_cols 边界保护（仅 a_col_has_label=True 且 header_col=1 时允许占位延伸）——修复 sheet"sheet_1_2" R7 B7='付款GMV' + C7='-' 错误合并 B7:C7；③ merge_header_rectangles 加 `is_in_other_merge` 排除独立合并干扰，并 unmerge 重叠 merge（修复 A1:C1 + A1:A4 合并后 openpyxl 留两个独立 merge 的 bug）；④ 保留 v3.52 的 Phase 2.5 跳过逻辑（A 列真值 == cell_val 时跳过 c≠1 源格横向合）。
-- **v3.52 (2026-09-17)**：① Phase 2.5 跳过条件从 v3.51 的"a_col_has_label=True 时跳过所有 c≠1 源格"精确为"A 列真值 == cell_val 时跳过 c≠1 源格"——防止 v3.51 误伤 sheet"2" R13（A13='<region_B>' vs B13='<region_sub>' 不同值）的 B13:C13 横合。
-- **v3.51 (2026-09-17)**：① Phase 2 列表头处理 col=1（A 列）例外不跳过——A 列是"行维度列"，整列所有行都是 header_cells 源格；防止 v3.50 修复 Q1 时误伤 sheet"2" R5 A5='<biz_unit>' + B5='-' + C5='-' 应合 A5:C5 的场景；② Phase 2.5 处理数据行源格时，如果该行 A 列有自己的标签（a_col_has_label=True），跳过 c≠1 源格的横向合——让 Phase 2 统一处理 A 列展开（避免 sheet"2" R6 B6:C6 + A6:C6 两个独立 merge 共存）。
-- **v3.50 (2026-09-17)**：① Phase 1 表头行竖向合禁用"重复值延伸"——防止 sheet"2" D2:D3 重复值竖向合导致 D2 横合 D2:AS2 被跳过、最终 merge_header_rectangles 扩展成 D2:Q3 越界；② Phase 2 列表头处理跳过 `r ∉ header_rows` 的源格——防止 sheet"sheet_1_2" R7 B7='付款GMV'（数据行的"行维度标签"）被当作表头源格参与 B7:C7 横合（C7 是数据）。
-- **v3.49 (2026-09-17)**：① 竖向合并支持"重复值延伸"——Phase 2 竖向合 next_val 允许空/占位/与源格同值，修复 sheet"sheet_1_2" B 列 R2:R16 重复值 '入账GMV' 应当竖向合并为 B2:B6 + B8:B16 + B17:B21 的需求。
-- **v3.48 (2026-09-17)**：① Phase 2 横向合引入 `a_col_has_label` 判定（该行 A 列有自己的标签 → 允许占位延伸）；② 排除"合计/总计/小计/汇总/标题"行源格的占位延伸（防止 sheet 0 R9 B9='合计' 越界合到 BE9）；③ `apply_rate_data_bar` 加"率列优先"判定——即使含 GMV 关键字，只要 `is_percent_column(last_header)=True` 就按率列处理（修复 sheet"4" 'col_<biz_alias_2>...' 缺 Data Bar）；④ `fill_empty_content_cells` 加 try-except 静默跳过合并副格（Phase 2 后跑时的 AttributeError）；⑤ 新增 Phase 2.5——遍历数据行内 c ∉ header_cols 的源格横向合（仅严格同值合并）。
-- **v3.47 (2026-09-16)**：① Phase 2 横向合按"源格行位置 + next_val 语义"三维判定——表头行源格不受 `max(header_cols)` 限制（合到 max_col）；数据行源格仅当 next_val 与源格严格同值才允许跨 header_cols 边界；② 解决 0/45/46 误判（v3.46 删除限制后导致 B6=Q6 这种数据行横向合越界）。
-- **v3.46 (2026-09-16)**：① Phase 2 横向合删除 `max(header_cols)` 限制——sheet"0" AS2='col_<biz_alias_7>）' 应合到 AS2:AY3；sheet"3.2" A7:C7='<region_B>' 应合（表头单元格重复值合并）；② `RATE_KEYWORDS` 加"留存率"——修复 sheet"4" 'col_<biz_alias_2>...' 误走万级；③ `PERCENT_NO_BAR_KEYWORDS` 扩充为含"费率/汇率/分润率/分佣率/折算率"——这 5 个关键字加 Data Bar 不加进度条；④ `apply_rate_data_bar` 加 `is_percent_no_bar_column` 拦截。
-- **v3.45 (2026-09-16)**：① `merge_header_by_rows` Phase 1 横向合右边界用 `max_col` 而非 `max(header_cols)`——sheet"0" R2/R3 横向合不再受 v3.39 加的"next_c ≤ max(header_cols)"保护误伤；② `bold_header_and_total_rows` 删除 `is_first_after_header` 限制——任何 ≥2 列横向合并行整行加粗；③ 新增 `_extend_to_nearest_nonempty_left_only` 辅助函数——仅向左搜 max_search 列，不右扩展，防止跨业务组边界污染 `apply_number_formats` 的 date fallback；④ `apply_number_formats` 在 `apply_rate_data_bar` 之前调用 `_get_header_cells_in_col` 都改用 left-only 变体；⑤ 新增 `MONEY_LIKE_KEYWORDS` 白名单——命中后强制走万级，不依赖均值阈值（修复 sheet"2" AH 列（上层='col_<biz_alias_1>'，均值仅 8645.79）误判为普通数字）。
-- **v3.44 (2026-09-14)**：① `is_date_like` 识别季度字符串（"26年Q1" 等），修复 sheet"0 达成率"列 fmt 错误；② Phase 2 横向合不再受 `phase1_prev_cover` 约束，修复 sheet"2" row 10 A10:C10 重复值合并只到 A:B 而非 A:C 的 bug。
-- **v3.43 (2026-09-14)**：① **表头"重复值合并"**——新增 `_can_extend_for_repeat_value`，改造 `merge_header_by_rows` 的 4 处扩展判断；② 占位符 `'-` / 空 / 数字维持原逻辑。
-- **v3.42 (2026-09-14)**：① `is_date_like` 识别 2 位年份字符串（`\d{2}\s*年\s*\d{1,2}\s*月`），修复 `format_header_dates` 格式化后 date fallback 失效 → 整数列错配普通数字格式的 bug；② `apply_rate_data_bar` / `apply_momyoy_data_bar` 互斥——前者跳过 `ws._momyoy_cols` 标记列，并主动检查 `is_momyoy_in_header_cells` 兜底，避免环比/同比列被双重条件格式叠加。
-- **v3.41 (2026-09-14)**：① `apply_number_formats` 统一为 5 优先级判定；② 最后一层 header 判定 + date fallback；③ GMV 关键字扫描严格化（排除"GMV考核"等子模块名）；④ 排除 GMV 列加进度条。
-- **v3.40 (2026-09-14)**：① `_preserve_sparklines_postsave` 保留迷你图（`<x14:sparklineGroups>` + `<ext>` wrapper + 命名空间）；② GMV 列强制万级格式。
-- **v3.39 (2026-09-14)**：① B6:C6 不应合并修复；② `_remove_ai_drawings_from_workbook` 加载后立即清空 drawings；③ `_strip_ai_artifacts_postsave` 清理 drawings/media/charts 浮层对象。
-- **v3.30 (2026-09-11)**：① `merge_header_by_rows` 入参改为 `header_cells` 集合 + 三段优先级分类（Phase 1 行表头先行再列，Phase 2 列表头先列再行）；② 关键修复——Phase 1 源格本身已被横向合（min_col==c）跳过竖向合；Phase 2 列表头竖向合时检查 next_r 同行横向合状态；③ 源格值改用 `ws.cell.value`（不被跨行合并覆盖判空影响）；④ 恢复 v3.22 prev_row_col_cover 约束；⑤ 关键场景验证：<biz_report> sheet1 → A5:A8/A9:A11/A12:A14 + A15:B15 + F3:G3 + AS2:AY3 (via AS1:BE1+AS1:AS3 合并路径)。
-- **v3.29 (2026-09-11)**：① `merge_header_by_rows` 入参改为 `header_cells` 集合；② 修复 dangling externalLink 引用 Bug；③ 保留 `merge_header_by_legacy_rows` 旧接口。
-- **v3.28 (2026-09-11)**：① `auto_fit_columns` 第一阶段 `horizontal_merges` 收集新增 `MAX_HEADER_TITLE_SPAN=6` 过滤——跳过跨度 >6 列的横向合并（如 `C1:AR1` 这类覆盖整片区域的"总标题"）；② 根因：原算法把总标题源格按 span 均分字符，每列 max_w ≈ 1，列宽塌回 `MIN_COL_WIDTH=8`；③ 修复后数据列按真实内容长度计算；表头宽度仍由第三步（标题行 wrap 扩展）按比例处理；④ **条件格式触发条件改为"列的所有表头单元格中任意一个含关键字"**——新增 `is_rate_in_header_cells` / `is_momyoy_in_header_cells` 辅助函数；`apply_rate_data_bar` / `apply_momyoy_data_bar` 改用新判定（不再依赖 `_build_multi_layer_headers` 拼接字符串）；⑤ **删除"严格金额列（含 金额/收入/支出/回款/定价）"触发条件**——`apply_money_alignment` 改空实现；`apply_number_formats` 内金额列居右删除。
-- **v3.27 (2026-09-11)**：① 去除行列定义改为单元格级定义——`detect_layout` 返回 `(header_rows, header_cols, data_rows, data_cols, header_cells, data_cells)` 六元组；② 表头列扫描范围改为 `[1, max(header_rows)]`，逐列独立判定（非 break 终止）；③ 下游5 函数新增 `header_cells` 参数，仅对数据单元格应用样式（数字格式、Data Bar、居右、`-` 填充）
-- **v3.22 (2026-09-10)**：① 表头合并算法重构为「逐行纵→横」(`merge_header_by_rows`)；② 新增「竖向优先」规则（已竖向合并的源格不再横向合并）；③ 新增「下一行合并不超上一行」规则（`prev_row_col_cover[c]` 列范围限制）
-- **v3.21 (2026-09-07)**：① 新增 `merge_header_rectangles` 矩形合并 pass2（A1 有值 / A2/B1/B2 全空 → 合并为 A1:B2）；② `RATE_KEYWORDS` 删除「达成/达标/通过/完成」4 个单字（避免与「完成日期/目标达成次数」等列名误匹配）；③ `_AI_ARTIFACT_PARTS` 扩展 customXml/queryTable/connections/externalLinks/vbaProject
-- **v3.20 (2026-09-07)**：① 万级底层值 /10000 + fmt `0.0万`（替代 v3.5-v3.6 的"显示 1500000.0万"多位小数问题）；② 合计行不再被识别为表头（含 TITLE_KEYWORDS 的行强制排除）；③ `is_numeric_for_header` 增强识别字符串数字；④ `format_header_dates` 跳过合并区域副格
-- **v3.19 (2026-09-06)**：找回 4 项遗漏规则（多层表头合并 / 多层表头月份格式 / 合并范围 ≥2 列加粗 / RATE_KEYWORDS 扩展）；阶段四新增 `_strip_ai_artifacts_postsave` 清除 AI/插件生成的浮层对象（drawings/comments/ctrlProps/activeX/embeddings/media/charts/pivotTables/slicers/tables）
-- **v3.18 (2026-09-06)**：阶段四清理 AI/工具生成的水印层（docProps/core.xml + docProps/app.xml）
-- **v3.17 (2026-09-04)**：自检扩展覆盖千分位 / 短数字 / 负数红 / 自定义格式 6 类规则
-- **v3.16 (2026-09-02)**：xwriter 模式沿用 input number_format + 自检规则 + 列宽增强
-- **v3.15 (2026-09-01)**：表头识别阈值暴露为 `--header-threshold` / `--header-max-scan`
-- **v3.14 (2026-09-01)**：xwriter 模式支持自动表头识别
-- **v3.13 (2026-09-01)**：表头识别放宽到"连续 N 行含数字"
-- **v3.12 (2026-08-31)**：打通 openpyxl → xlsxwriter
-- **v3.11 (2026-08-30)**：百分比负数红 + 进度条确认
-- **v3.10 (2026-08-30)**：列宽格式后缀追加
-- **v3.9 (2026-08-30)**：去除 AI 输出水印
-- **v3.8 (2026-08-30)**：Excel 双击自适配列宽 + 行高
-- **v3.7 (2026-08-30)**：行高自适应 + debug 模式 + 明细大表降级
-- **v3.6 (2026-08-29)**：关键 bug 修复（万级 / 百分比 / 表头加粗）
-- **v3.5 (2026-08-29)**：用户反馈修订 4 项
-- **v3.4 (2026-08-29)**：用户反馈修订 5 项
-- **v3.3 (2026-08-29)**：修复 3 个关键 bug
-- **v3.2 (2026-08-29)**：用户反馈细化 6 项
-- **v3.1 (2026-08-28)**：标题区 / 内容区分区处理
-- **v3 (2026-08-28)**：用户反馈修订
-- **v2 (2026-08-28)**：重大增强（11 项新规则）
-- **v1 (2026-08-27)**：初始创建（5 类样式规则）
+### 当前版本:v3.54 (2026-09-20)
 
-详细修订记录见 [logs/log.md](computer://<PROJECT_ROOT>\.agents\skills\excel-style-cleaner\logs\log.md)。
+### 最近 10 版索引
+
+| 版本 | 日期 | 标题 | 关键改动 |
+|------|------|------|----------|
+| v3.54 | 2026-09-20 | 行级指标标签覆盖列级格式 + 整列整数判定 | 新增 `_column_all_integer`；INTEGER_COUNT_KEYWORDS 行级覆盖 |
+| v3.53 | 2026-09-17 | Phase 1 先横后竖 + Phase 2 占位跨边界保护 | Phase 1 顺序调整；merge_header_rectangles 加 is_in_other_merge |
+| v3.52 | 2026-09-17 | Phase 2.5 跳过条件精确化 | "A列真值 == cell_val" 才跳过 |
+| v3.51 | 2026-09-17 | Phase 2 col=1 例外不跳过 + Phase 2.5 跳过 | A 列是行维度列；a_col_has_label 跳过 |
+| v3.50 | 2026-09-17 | Phase 1 禁用重复值竖向合 + Phase 2 跳过数据行源格 | 防止 D2:D3 → D2:AS2 越界 |
+| v3.49 | 2026-09-17 | 竖向合并支持重复值延伸 | sheet"1.2" B2:B6 + B8:B16 + B17:B21 |
+| v3.48 | 2026-09-17 | a_col_has_label + 合计行排除 + GMV 率列优先 | 修复"col_<biz_alias_2>"缺 Data Bar |
+| v3.47 | 2026-09-16 | Phase2 横向合越界修复 | 三维判定（行位置+next_val 语义） |
+| v3.46 | 2026-09-16 | 4 项判定 bug 修复 | 删 max(header_cols) 限制；加"留存率"/"费率/汇率/..." 关键字 |
+| v3.45 | 2026-09-16 | 4 项判定 bug 修复 | Phase1 用 max_col；删除 is_first_after_header；left-only 扩展；MONEY_LIKE_KEYWORDS |
+
+完整索引与每版详细日志见 [logs/log.md](computer://<PROJECT_ROOT>\.agents\skills\excel-style-cleaner\logs\log.md)。

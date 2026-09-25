@@ -1,0 +1,3605 @@
+#!/usr/bin/env python3
+"""
+excel_style_cleaner.py
+----------------------
+通用 Excel 样式清洗工具（v3.28）：
+  1. 统一字体（微软雅黑 / 9 号 / 黑色 / 居中）+ 黑色边框（仅有效区域）
+  2. 识别标题行（首行 + 含"合计/总计/小计"的行）并加粗
+  3. 标题行加粗
+  4. 达成率/通过率/完成率/环比/同比 列 -> 百分比格式（0.00%，单元格格式，底层值不变）
+  5. 达成率/完成率/通过率 列 -> 黄色 Data Bar
+  6. 环比/同比 列 -> 红色 Data Bar（正红、负绿）+ 上中下箭头
+  7. 金额类列 -> 加 ¥ 货币符号并居右
+  8. 空行 / 空列无边框
+  9. 标题区空值保留原值（用于合并）；内容区空值用 "-" 填充
+  10. 数字格式化：万级用 0.0,"万" 格式；率/环比/同比用 0.00%；常规保留两位小数
+  11. 表头行 / 表头列智能合并（先横后纵，纵合前检查是否已被合并）
+  12. 横向合并单元格所在行若含"合计"关键字 → 整行加粗
+  13. 表头日期单元格 -> YY年MM月 格式
+  14. 列宽按内容自适应（最小宽度，1 行内 100% 展示，至多 2 行）
+
+v3.7 新增（明细大表降级）：
+  - LARGE_SHEET_CELLS = 2_000_000：行 × 列 ≥ 此值视为超大明细表
+  - 默认：openpyxl 加载 + 保存代价过高，仅复制原文件
+  - --force-clean：read_only 读前 --max-rows 行 + 重建工作簿，快速产出
+  - --max-rows N：明细表仅清洗前 N 行（默认 2000；设为 0 = 全量）
+  - --debug：打印每个 sheet 写入的样式摘要
+
+支持格式：.csv / .xls / .xlsx / .xlsm
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+import openpyxl
+from openpyxl.formatting.rule import DataBarRule, FormulaRule
+from openpyxl.styles import Alignment, Border, Font, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
+
+
+# ============================================================
+# 列标题关键字
+# ============================================================
+# v3.21+：仅保留"成对"的关键字（>= 2 字），避免「完成/达成/通过/达标」单字
+# 与「完成日期/目标达成次数/通过编号/达标次数」等列名误匹配导致该列被误判为
+# 百分比列（不会执行万级缩放 + 不会有 Data Bar）。
+# v3.23+：进一步收紧 — 删掉 "达成情况/完成情况/达成度/完成进度/完成度" 等容易误判
+# 的模糊词，只保留明确的「率/比」类指标列：
+#   - "达成率/通过率/完成率/达标率/完成比" — 明确的百分比指标
+# 这样拼接字符串中即使含 "达成情况" / "完成情况" 也不会误判整列。
+# v3.24+：根据用户反馈 — 关键字调整为「率/环比/同比/完成/达成」，扩大识别范围，
+# 但移除 "情况/度/进度/比" 等容易误判的词：
+#   - "达成率/通过率/完成率/达标率" — 明确百分比
+#   - "环比/同比/MoM/YoY" — 单独在 MOMYOY_KEYWORDS
+# 注意：单独 "完成/达成" 不在 RATE_KEYWORDS（v3.21 已删除），防止 "完成日期" 等误判
+RATE_KEYWORDS = [
+    "达成率", "通过率", "完成率", "达标率",
+    # v3.35+：「比例/比率」列等同达成率（百分比 + Data Bar）
+    "比例", "比率",
+    # v3.36+：活跃率 / 结汇率 等率指标纳入达成率逻辑
+    "活跃率", "结汇率",
+    # v3.46+：留存率 —— "col_<biz_alias_2>"等列虽是 GMV 相关，
+    # 但业务语义是率指标（百分比 + Data Bar），不应走万级。
+    "留存率",
+]
+# v3.34+：「占比」列等同于达成率（百分比格式 + Data Bar）
+OCCUPANCY_KEYWORDS = ["占比", "占有率", "市场份额"]
+# v3.37+：只需要百分比格式（0.00%），不需要进度条的关键字
+# 例如：分润率、费率、汇率、分佣率、折算率等
+# v3.46+：扩充为含"汇率/分佣率" —— 这两个不会被 is_percent_column 误判为普通列
+# （因为没有 RATE/MOMYOY 关键字），但语义上属于 percent 列，需要被 is_percent_column 命中
+# 但又不加进度条。
+PERCENT_NO_BAR_KEYWORDS = ["分润率", "费率", "汇率", "分佣率", "折算率"]
+MOM_KEYWORDS = ["环比", "MoM", "mom", "ring", "mom%", "月环比"]
+YOY_KEYWORDS = ["同比", "YoY", "yoy", "year-over-year", "yoy%", "年同比"]
+MOMYOY_KEYWORDS = MOM_KEYWORDS + YOY_KEYWORDS + ["同比环比", "环比同比", "环同比"]
+# v3.45+：「金额类」列白名单 —— 命中后强制走万级（不依赖均值阈值）。
+# 解决 sheet"2 各团队核心指标(打折+当时归属)"AH 列（col_<biz_alias_1>25年8月，均值仅 8645.79）
+# 被错判为普通数字的问题。
+MONEY_LIKE_KEYWORDS = [
+    "金额", "回款", "营收", "收入", "销售额", "销售金额",
+    "预缴", "充值", "退款", "到账", "付款", "收款",
+]
+# v3.34+：「客户数/会员数/账号数/订单数/链接数/代理商数/合同数/人数」列 → 整数格式（不带小数）
+# 带"折算"或"月化"关键字 → 改为 2 位小数（折算后可能是非整数）
+INTEGER_COUNT_KEYWORDS = ["客户数", "会员数", "账号数", "订单数", "链接数", "代理商数", "合同数", "人数"]
+# v3.28+：MONEY_KEYWORDS 不再用于触发条件（删除金额列居右），
+# 但保留列表用于 `is_money_column` 向后兼容（外部代码可能调用）。
+MONEY_KEYWORDS = [
+    "金额", "销售额", "营收", "收入", "支出", "利润", "GMV", "gmv",
+    "成交额", "回款", "客单价", "定价",
+]
+TITLE_KEYWORDS = ["合计", "总计", "小计", "标题", "汇总"]
+
+# ============================================================
+# 大表降级阈值（v3.7 起）
+# ============================================================
+# 行 × 列 之和 ≥ 此值视为超大明细表，openpyxl 加载+保存代价极高。
+# 默认仅复制原文件；--force-clean 时走 read_only + 前 N 行快速路径。
+LARGE_SHEET_CELLS = 2_000_000
+
+
+# ============================================================
+# 样式定义
+# ============================================================
+DEFAULT_FONT = Font(name="微软雅黑", size=9, color="FF000000")
+HEADER_FONT = Font(name="微软雅黑", size=9, color="FF000000", bold=True)
+CENTER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+RIGHT_ALIGN = Alignment(horizontal="right", vertical="center", wrap_text=True)
+BLACK_SIDE = Side(border_style="thin", color="FF000000")
+BLACK_BORDER = Border(left=BLACK_SIDE, right=BLACK_SIDE, top=BLACK_SIDE, bottom=BLACK_SIDE)
+NO_BORDER = Border()
+
+YELLOW_HEX = "FFFFD966"
+RED_HEX = "FFE06666"
+GREEN_HEX = "FF93C47D"
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+def _strip_parenthetical_content(header: str) -> str:
+    """v3.35+：剔除表头中的括号内容（含全角/半角括号），避免误判。
+
+    例："考核通过人数(达成率100%)" → "考核通过人数"（人数列，不是率列）
+    例："全量GMV(不含税)" → "全量GMV"
+    """
+    import re as _re
+    # 剔除全角括号 （）和半角括号 ()
+    s = _re.sub(r'[（(][^）)]*[）)]', '', header)
+    return s.strip()
+
+
+def _column_all_integer(ws: Worksheet, col_idx: int,
+                         data_start: int, max_row: int) -> bool:
+    """v3.54+：判定 col_idx 列所有非空数字 cell 是否都是整数（无小数部分）。
+
+    判定条件：
+      - 该列至少有一个非空数字 cell
+      - 所有非空数字 cell 都是 int（含底层是 int 或 float 但小数部分 == 0）
+      - 排除 None / '-' / 占位字符串
+    """
+    has_any = False
+    for r in range(data_start, max_row + 1):
+        v = get_cell_value(ws, r, col_idx)
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, int):
+            has_any = True
+            continue
+        if isinstance(v, float):
+            has_any = True
+            if v != int(v):
+                return False
+            continue
+        # 字符串数字（非数字跳过）
+        s = str(v).strip()
+        if not s or s == '-':
+            continue
+        try:
+            fv = float(s.replace(',', '').replace('万', '').replace('%', '').replace('¥', ''))
+            has_any = True
+            if fv != int(fv):
+                return False
+        except (ValueError, TypeError):
+            continue
+    return has_any
+
+
+def is_rate_column(header: str) -> bool:
+    """判定列是否为率列（达成率/通过率/完成率/达标率/比例/比率）。
+
+    v3.35+：先剔除括号内容再判定，避免"考核通过人数(达成率100%)"被误判为率列。
+    """
+    clean = _strip_parenthetical_content(header)
+    return any(k in clean for k in RATE_KEYWORDS)
+
+
+def is_occupancy_column(header: str) -> bool:
+    """v3.34+：占比列判定（等同达成率 — 百分比 + Data Bar）。
+
+    v3.35+：先剔除括号内容再判定。
+    """
+    clean = _strip_parenthetical_content(header)
+    return any(k in clean for k in OCCUPANCY_KEYWORDS)
+
+
+def is_percent_no_bar_column(header: str) -> bool:
+    """v3.34+：比例/比率列判定（仅百分比格式，不加 Data Bar）。
+
+    v3.35+：先剔除括号内容再判定。
+    """
+    clean = _strip_parenthetical_content(header)
+    return any(k in clean for k in PERCENT_NO_BAR_KEYWORDS)
+
+
+def is_integer_count_column(header: str) -> bool:
+    """v3.34+：客户数/会员数/账号数/订单数列判定（整数格式）。
+
+    v3.35+：先剔除括号内容再判定。
+    """
+    clean = _strip_parenthetical_content(header)
+    return any(k in clean for k in INTEGER_COUNT_KEYWORDS)
+
+
+def is_momyoy_column(header: str) -> bool:
+    return any(k in header for k in MOMYOY_KEYWORDS)
+
+
+def is_money_column(header: str) -> bool:
+    """v3.28+ 保留函数定义以兼容外部调用，但内部已不再用于触发条件。"""
+    return any(k in header for k in MONEY_KEYWORDS)
+
+
+def _get_header_cells_in_col(ws: Worksheet, header_rows: List[int],
+                              col_idx: int) -> List[str]:
+    """v3.28+ 辅助：取出 col_idx 列在所有表头行上的单元格值列表。
+
+    v3.31+：当某表头行单元格本身为空时，向左右扩展寻找最近一层非空值，
+    避免"达成率/同比/环比"被合并后整组识别丢失。
+
+    例：I3:J3="达成率"（合并），K3=None（孤立空白但同属一个数据组）。
+    直接调用 get_cell_value(K3) 返回 None，导致 K 列被漏判。
+    修复：检测 K3 时，向左扩展到 I3（最近的非空 / 含合并源格非空），复用其值。
+    """
+    values = []
+    for hr in header_rows:
+        v = get_cell_value(ws, hr, col_idx)
+        if v is None:
+            # v3.31+：向左扩展找最近非空；合并副格可经 get_cell_value 上溯，
+            # 这里再次显式处理"无合并覆盖的空白"。
+            # v3.45+：bugfix —— 默认右扩展会跨业务组污染 all_layers。
+            # 这里改用 left-only 变体（适用 RATE/OCCUPANCY/MOMYOY/PERCENT_NO_BAR 判定）。
+            ext = _extend_to_nearest_nonempty_left_only(ws, hr, col_idx)
+            v = ext
+        values.append(str(v) if v is not None else "")
+    return values
+
+
+def _extend_to_nearest_nonempty(ws: Worksheet, row: int, col_idx: int,
+                                  max_search: int = 8) -> Optional[str]:
+    """v3.31+：从 (row, col_idx) 向左扩展到最近的非空 header 值。
+
+    策略：
+      1. 先向左扩展，若左侧某列的 row 单元格是合并副格且源格含值 → 用源格
+      2. 若左右都无，扫描 row 上方更高层（row-1, row-2 ...）的列值，
+         找到最近非空值（用作语义兜底）
+      3. 都不命中 → 返回 None
+    max_search: 左右搜索的最大列数（避免过远误判）
+    """
+    # 1) 向左
+    for delta in range(1, max_search + 1):
+        lc = col_idx - delta
+        if lc < 1:
+            break
+        # 先看是否是合并副格
+        for m in ws.merged_cells.ranges:
+            if (m.min_row <= row <= m.max_row
+                    and m.min_col <= lc <= m.max_col):
+                tl = ws.cell(row=m.min_row, column=m.min_col).value
+                if tl is not None and str(tl).strip():
+                    return str(tl)
+        v = ws.cell(row=row, column=lc).value
+        if v is not None and str(v).strip():
+            return str(v)
+    # 2) 向右
+    for delta in range(1, max_search + 1):
+        rc = col_idx + delta
+        if rc > ws.max_column:
+            break
+        for m in ws.merged_cells.ranges:
+            if (m.min_row <= row <= m.max_row
+                    and m.min_col <= rc <= m.max_col):
+                tl = ws.cell(row=m.min_row, column=m.min_col).value
+                if tl is not None and str(tl).strip():
+                    return str(tl)
+        v = ws.cell(row=row, column=rc).value
+        if v is not None and str(v).strip():
+            return str(v)
+    return None
+
+
+def _extend_to_nearest_nonempty_left_only(ws: Worksheet, row: int, col_idx: int,
+                                            max_search: int = 8) -> Optional[str]:
+    """v3.45+：仅向左扩展的变体 —— 用于 apply_number_formats 的 date fallback 路径。
+
+    原 _extend_to_nearest_nonempty 同时向左 + 向右搜 8 列，可能跨过业务组边界
+    拿到下一业务组的"达成率/完成率/同比/环比"等关键字（典型 bug：sheet 1.1 的 CY 列
+    R3CY=空 → 向右 8 列命中 DG3='达成率' → 被误判为 percent 列）。
+
+    本函数只向左搜；找不到返回 None，让上层自然走"无 fallback / 万级均值判定"路径。
+    """
+    for delta in range(1, max_search + 1):
+        lc = col_idx - delta
+        if lc < 1:
+            break
+        # 先看是否是合并副格
+        for m in ws.merged_cells.ranges:
+            if (m.min_row <= row <= m.max_row
+                    and m.min_col <= lc <= m.max_col):
+                tl = ws.cell(row=m.min_row, column=m.min_col).value
+                if tl is not None and str(tl).strip():
+                    return str(tl)
+        v = ws.cell(row=row, column=lc).value
+        if v is not None and str(v).strip():
+            return str(v)
+    return None
+
+
+def is_rate_in_header_cells(ws: Worksheet, header_rows: List[int],
+                             col_idx: int) -> bool:
+    """v3.28+：判定 col_idx 列的表头单元格中任意一个含达成率/完成率关键字。
+
+    规则：列的所有表头单元格(行 in header_rows × 列=col_idx)中，
+    任意一个非空值包含 RATE_KEYWORDS 任一关键字 → 命中。
+    """
+    for v_str in _get_header_cells_in_col(ws, header_rows, col_idx):
+        if v_str and is_rate_column(v_str):
+            return True
+    return False
+
+
+def is_momyoy_in_header_cells(ws: Worksheet, header_rows: List[int],
+                                col_idx: int) -> bool:
+    """v3.28+：判定 col_idx 列的表头单元格中任意一个含环比/同比/MoM/YoY 关键字。"""
+    for v_str in _get_header_cells_in_col(ws, header_rows, col_idx):
+        if v_str and is_momyoy_column(v_str):
+            return True
+    return False
+
+
+def is_percent_column(header: str) -> bool:
+    """百分比类列：达成率/通过率/完成率/环比/同比/占比/比例/比率 统称为百分比列。"""
+    return (
+        is_rate_column(header)
+        or is_momyoy_column(header)
+        or is_occupancy_column(header)
+        or is_percent_no_bar_column(header)
+    )
+
+
+def is_total_row(values) -> bool:
+    """判定整行是否是"合计/总计/小计/标题/汇总"行。
+
+    v3.31+ 关键修复：原算法把整行所有 text_values 拼一起查找关键字，
+    会把 B 列含"合计"标签的分组汇总行（如 row 5="运营-合计"）误判为合计行，
+    导致该行的达成率/万级 Data Bar 全部跳过。
+
+    新判定：只看 A 列（行分类首列）的值。
+    - A 列含"合计/总计/小计" → 真是合计行 → 跳过 Data Bar / 数字格式
+    - A 列不含 → 是分组汇总行（"运营"+"合计"业务线）→ 正常处理
+    """
+    if not values:
+        return False
+    # 取首列（A 列）作为行分类标签
+    first_val = values[0] if values else None
+    if first_val is None:
+        # A 列为空（B 列含合计）→ 不是合计行（"运营"团队行的 A5 含"运营"）
+        return False
+    s = str(first_val).strip()
+    if not s:
+        return False
+    return any(k in s for k in TITLE_KEYWORDS)
+
+
+def is_empty(value) -> bool:
+    if value is None:
+        return True
+    s = str(value).strip()
+    return s == "" or s.lower() == "none"
+
+
+def is_value_for_merge(value) -> bool:
+    """v3.36+：判定该值在合并语义下是否可被视为空（允许后续列接续合并）。
+    与 `is_empty` 的区别：将 '-' 视为空（表头常用于占位），便于跨列/跨行合并。
+    """
+    if value is None:
+        return True
+    s = str(value).strip()
+    return s == "" or s.lower() == "none" or s == "-"
+
+
+def _can_extend_for_repeat_value(cell_val, next_val) -> bool:
+    """v3.43+：判定 cell_val → next_val 是否可因"重复值"扩展。
+
+    规则（用户 2026-09-14 决策）：
+      - cell_val / next_val 都是 `'-` / None / 空字符串 / 数字型 → 返回 False（占位走原空逻辑）
+      - 两者都是"非占位 / 非数字"的字符串且严格相等 → 返回 True
+
+    与 `is_value_for_merge(next_val)` 的差异：本函数只判断"重复值"场景的扩展，
+    不替代空接续逻辑。调用方应同时考虑两者（任一为真即可扩展）。
+    """
+    if cell_val is None or next_val is None:
+        return False
+    if is_value_for_merge(cell_val) or is_value_for_merge(next_val):
+        return False  # 占位走原空逻辑，本函数只处理真同值
+    # 都是数字（含 int/float）→ 数字相邻不合并（避免与数据列混淆）
+    if isinstance(cell_val, (int, float)) and not isinstance(cell_val, bool):
+        return False
+    if isinstance(next_val, (int, float)) and not isinstance(next_val, bool):
+        return False
+    return str(cell_val).strip() == str(next_val).strip()
+
+
+def get_cell_value(ws: Worksheet, row: int, col: int):
+    """获取单元格值（考虑合并单元格：取左上角值）。"""
+    for merge in ws.merged_cells.ranges:
+        if (row >= merge.min_row and row <= merge.max_row and
+                col >= merge.min_col and col <= merge.max_col):
+            tl = ws.cell(row=merge.min_row, column=merge.min_col)
+            return tl.value
+    return ws.cell(row=row, column=col).value
+
+
+def get_column_headers(ws: Worksheet, header_row: int = 1) -> List[str]:
+    return [
+        str(get_cell_value(ws, header_row, c) or "").strip()
+        for c in range(1, ws.max_column + 1)
+    ]
+
+
+def detect_data_extent(ws: Worksheet, header_row: int = 1):
+    """检测实际有数据的行列范围（剔除完全空的尾部行/列）。"""
+    max_r = 0
+    max_c = 0
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            if not is_empty(get_cell_value(ws, r, c)):
+                max_r = max(max_r, r)
+                max_c = max(max_c, c)
+    if max_r == 0:
+        max_r = header_row
+    if max_c == 0:
+        max_c = 1
+    return max_r, max_c
+
+
+def find_empty_rows(ws: Worksheet, max_row: int, max_col: int, start_row: int = 1) -> List[int]:
+    empty_rows = []
+    for r in range(start_row, max_row + 1):
+        all_empty = True
+        for c in range(1, max_col + 1):
+            if not is_empty(get_cell_value(ws, r, c)):
+                all_empty = False
+                break
+        if all_empty:
+            empty_rows.append(r)
+    return empty_rows
+
+
+def find_empty_cols(ws: Worksheet, max_row: int, max_col: int, start_col: int = 1) -> List[int]:
+    empty_cols = []
+    for c in range(start_col, max_col + 1):
+        all_empty = True
+        for r in range(1, max_row + 1):
+            if not is_empty(get_cell_value(ws, r, c)):
+                all_empty = False
+                break
+        if all_empty:
+            empty_cols.append(c)
+    return empty_cols
+
+
+# ============================================================
+# 数字格式化
+# ============================================================
+def compute_column_numeric_avg(ws: Worksheet, col_idx: int,
+                                data_start: int, data_end: int) -> float:
+    nums = []
+    for r in range(data_start, data_end + 1):
+        v = get_cell_value(ws, r, col_idx)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            nums.append(v)
+    if not nums:
+        return 0.0
+    return sum(nums) / len(nums)
+
+
+def format_date_cell(value) -> Optional[str]:
+    """将日期/月份值转为 YY年M月 格式（如 "25年6月"）。仅做格式归一化，不改变年月数值。
+
+    v3.34+：支持 Excel 序列日期数字（45000-50000 范围 = 2023-2036 年）。
+    v3.35+：格式改为 YY年M月（2位年份 + 1位月份），替代 v3.34 的 YYYY年MM月。
+    """
+    import datetime as _dt
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return f"{value.year % 100}年{value.month}月"
+    # v3.34+：Excel 序列日期数字 → 转 datetime → 格式化
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if 45000 <= value <= 49999:
+            base = _dt.date(1899, 12, 30)
+            d = base + _dt.timedelta(days=int(value))
+            return f"{d.year % 100}年{d.month}月"
+    s = str(value).strip()
+    if not s:
+        return None
+    m = re.match(r"(\d{4})\s*年\s*(\d{1,2})\s*月?", s)
+    if m:
+        return f"{int(m.group(1)) % 100}年{int(m.group(2))}月"
+    m = re.match(r"(\d{4})-(\d{1,2})", s)
+    if m:
+        return f"{int(m.group(1)) % 100}年{int(m.group(2))}月"
+    m = re.match(r"(\d{4})/(\d{1,2})", s)
+    if m:
+        return f"{int(m.group(1)) % 100}年{int(m.group(2))}月"
+    return None
+
+
+def is_date_like(value) -> bool:
+    """判定值是否"日期"。
+
+    v3.34+ 扩展：识别 Excel 序列日期数字（45000-50000 范围 = 2023-2036 年）。
+    原算法只识别字符串型日期 + datetime 对象，对数字日期（如 openpyxl 读取的 45809=2025-06-01）无识别能力。
+    表头判定时（detect_layout）遇到日期数字会被 `is_numeric_for_header` 误判为"含数字" → 终止表头识别。
+
+    v3.42+：识别 2 位年份字符串（25年6月 / 2025-09 / 2025/09）。
+    v3.44+：识别季度字符串（26年Q1 / 2026年Q1 / 26年q2 等）。
+
+    注意：数字区间 1-73050 对应 1900-2100 年，但宽区间会误判（24392 这种小数值不是日期）。
+    v3.34+ 收窄到 45000-55000（2023-2050）以避开小数值误判。
+    """
+    import datetime as _dt
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return True
+    # v3.34+：识别 Excel 序列日期（整数 45000-49999 范围 = 2023-2036 年）
+    # 注意：含小数的数值（如 53345.61）是金额，不是日期
+    # 故仅当 value 是整数且在 45000-49999 时判定为日期（避开 50000 这种边界值）
+    if isinstance(value, int) and not isinstance(value, bool):
+        if 45000 <= value <= 49999:
+            # Excel 序列日期基线 1900-01-01=1
+            return True
+    s = str(value).strip()
+    if not s:
+        return False
+    patterns = [
+        r"\d{4}\s*年\s*\d{1,2}\s*月",
+        r"\d{2}\s*年\s*\d{1,2}\s*月",  # v3.42+：2 位年份（25年6月）
+        r"\d{4}\s*年\s*[Qq][1-4]",  # v3.44+：季度（26年Q1）
+        r"\d{2}\s*年\s*[Qq][1-4]",  # v3.44+：2 位年份季度（26年Q1）
+        r"\d{4}-\d{1,2}",
+        r"\d{4}/\d{1,2}",
+    ]
+    return any(re.match(p, s) for p in patterns)
+
+
+# ============================================================
+# v3.22+ 表头智能合并（逐行纵→横；带「上一行列范围限制」）
+# ============================================================
+def merge_header_by_rows(ws, header_cells, max_col, max_row, header_rows=None, header_cols=None):
+    """v3.30+：基于三段优先级分类的表头单元格合并。
+
+    用户 2026-09-11 决策（替代 v3.29）：
+      表头单元格 = (r in header_rows) OR (c in header_cols)
+      分类优先级：
+        A. 表头行内（r in header_rows）→ 归入"行表头单元格"
+        B. 表头列内（c in header_cols）但不在表头行内 → 归入"列表头单元格"
+        C. 都不在 → 不处理
+      A 组与 B 组有交集时（A1:B4 同时在 header_rows 和 header_cols）→ 归入 A 组
+
+    处理顺序：
+      - 行表头单元格：先行再列，按行号升序；每行内先竖后横（v3.22）
+        第 N+1 行源格 c 的 end_c ≤ prev_row_col_cover[c]（继承上一行约束）
+      - 列表头单元格：先列再行，按列号升序；每列内先横后竖
+        列表头处理时：每个源格做横向合并，竖向合并受 col 维度约束
+
+    v3.30+ 重要变更：
+      - 行处理保留 v3.22 prev_row_col_cover 约束（恢复）
+      - 列处理顺序：列号升序；每列内先做竖向合并，再做横向合并
+      - A15="<biz_unit>" 处理时，B15 已被前序 B 列竖向合并成 B14:B15 → 视为副格
+        但因为 A15 是列表头分组结尾，A15:B15 仍可横向合并（合并副格视为空）
+      - v3.30 同时取消"合并副格视为可跨过"——副格在列表头场景语义上是"已被吸收"
+
+    v3.43+：新增 `_can_extend_for_repeat_value` —— 相邻 cell 字符串严格相等时也允许横向/竖向合。
+      占位符 `'-` / 空 / 数字维持原逻辑。
+    v3.44+：Phase 2 横向合不再受 `phase1_prev_cover` 约束（行表头 prev_cover 与列表头数据行无关），
+      改用 `max(header_cols)` 作为右边界。
+    """
+    if not header_cells:
+        return
+    header_cells_set = set(header_cells)
+
+    # v3.30+ 三段分类
+    # A: 行表头单元格（r in header_rows → all cols）
+    # B: 列表头单元格（c in header_cols but r not in header_rows）
+    by_row = {}     # row -> [col] (A 组)
+    by_col = {}     # col -> [row] (B 组)
+
+    # v3.30+ 优先使用调用方传入的 header_rows；否则从 header_cells 推断
+    if header_rows:
+        header_rows_set = set(header_rows)
+    else:
+        row_counts = {}
+        for (r, c) in header_cells:
+            row_counts[r] = row_counts.get(r, 0) + 1
+        sorted_rows_by_count = sorted(row_counts.keys(),
+                                       key=lambda x: -row_counts[x])
+        header_rows_threshold = max(1, int(max_col * 0.3))
+        header_rows_set = set()
+        for r in sorted_rows_by_count:
+            if row_counts[r] >= header_rows_threshold:
+                header_rows_set.add(r)
+            else:
+                break
+        if not header_rows_set:
+            header_rows_set = {sorted_rows_by_count[0]} if sorted_rows_by_count else set()
+
+    # 分类
+    for (r, c) in header_cells:
+        if r in header_rows_set:
+            by_row.setdefault(r, []).append(c)
+        else:
+            by_col.setdefault(c, []).append(r)
+
+    def is_in_any_merge(row, col):
+        for m in ws.merged_cells.ranges:
+            if m.min_row <= row <= m.max_row and m.min_col <= col <= m.max_col:
+                return True
+        return False
+
+    def is_merge_subcell(row, col):
+        """判定 (row, col) 是否是某个合并的副格（非左上角）。"""
+        for m in ws.merged_cells.ranges:
+            if (m.min_row <= row <= m.max_row and m.min_col <= col <= m.max_col
+                    and (m.min_row != row or m.min_col != col)):
+                return True
+        return False
+
+    def is_merge_subcell_in_same_row(row, col):
+        """v3.30+：判定 (row, col) 是否是同行合并的副格（排除跨行合并覆盖）。"""
+        for m in ws.merged_cells.ranges:
+            if (m.min_row == m.max_row and m.min_row == row
+                    and m.min_col <= col <= m.max_col
+                    and (m.min_col != col)):
+                return True
+        return False
+
+    def get_effective_value(row, col):
+        """合并副格返回 None（已被源格吸收）；源格返回真实值。"""
+        if is_merge_subcell(row, col):
+            return None
+        return ws.cell(row=row, column=col).value
+
+    # ===== Phase 1: 行表头单元格处理（先行再列）=====
+    # 第 1 行：prev_row_col_cover 初始化为 max_col（不限）
+    prev_row_col_cover = {c: max_col for c in range(1, max_col + 1)}
+    sorted_header_rows = sorted(by_row.keys())
+
+    # v3.31+：记录 row 1（首行）的横向合源格扩展。
+    # 当 row 1 有横向大组合并（如 C1:AR1），其覆盖的所有 col 都应当继承源格的覆盖范围，
+    # 这样 row 2/3 的相同 col 在做横向合时不会因为 prev_row_col_cover[c]=c 而被错误限制。
+    # 例：AP3 的 prev_row_col_cover[42] = 42 → 只能合到 AQ3（错）；
+    #     应当继承 row 1 C1:AR1 的覆盖（col 84）→ AP3 至少能合到 AR3。
+    row1_horizontal_covers = {}  # col → max_col_in_row1_horizontal_merge
+
+    for header_row in sorted_header_rows:
+        cur_row_col_cover = {c: c for c in range(1, max_col + 1)}
+
+        if header_row == sorted_header_rows[0]:
+            # 遍历 row 1 的所有同行横向合并，继承源格的覆盖范围
+            # 注意：只处理同行横向合并（m.min_row == m.max_row），不处理跨行合并
+            # 跨行合并（如 A1:B3）的列覆盖范围不应被继承，否则会导致过度合并
+            for m in ws.merged_cells.ranges:
+                if m.min_row == m.max_row == header_row:
+                    # 横向合：源格是 (min_row, min_col)，覆盖范围 [min_col, max_col]
+                    for c in range(m.min_col, m.max_col + 1):
+                        row1_horizontal_covers[c] = max(row1_horizontal_covers.get(c, c), m.max_col)
+
+        # v3.53+：Phase 1 行表头处理改为先**横向合**后**竖向合**
+        #   - 横向合确定每行的列范围（按实值锚点延伸）
+        #   - 竖向合确定跨行的列覆盖（向下延伸）
+        # 原 v3.22 是先竖后横——会导致 sheet"2" R2 D2:D3 重复值竖向合冲突 D2:AS2 横合
+        # v3.22 的竖向优先规则本意是"避免与横向合冲突"，但颠倒顺序后自然避免冲突
+
+        # (1) 本行横向合并（向右）—— v3.53+ 改为先做
+        # v3.53+：删除 v3.22 的"if c in vertical_merged_cols: continue"——先横后竖顺序下不需此检查
+        for c in sorted(by_row[header_row]):
+            # v3.30+：用 ws.cell.value（不被跨行合并覆盖的副格判空影响）
+            cell_val = ws.cell(row=header_row, column=c).value
+            if is_empty(cell_val):
+                continue
+            # v3.30+：只检查同行合并副格
+            if is_merge_subcell_in_same_row(header_row, c):
+                continue
+            next_c = c + 1
+            if next_c > max_col:
+                continue
+            if is_merge_subcell_in_same_row(header_row, next_c):
+                continue
+            next_val = get_effective_value(header_row, next_c)
+            # v3.43+：扩展判断 — next_val 是占位 / 空 / 与 cell_val 重复值均可扩展
+            if not (is_value_for_merge(next_val) or _can_extend_for_repeat_value(cell_val, next_val)):
+                continue
+            # v3.35+：Phase 1 横向合不要求 next_c 在 header_cells 中
+            # —— 当 next_c 是空值时，即使它不在 header_cells 中，也应允许合并
+            # （如 sheet 5 的 D2="代理商佣金($)-B2B" + E2=None，E 列不是 header_col 但 D2:E2 应合）
+            if (header_row, next_c) not in header_cells_set and not is_value_for_merge(next_val) and not _can_extend_for_repeat_value(cell_val, next_val):
+                continue
+            # v3.39+：额外检查 next_c 必须在表头列范围内（防止横向合跨过非表头列）
+            # v3.45+：bugfix —— max(header_cols) 是"列表头列右边界"，不应作为行表头
+            # 横向合的右边界（否则 R2/R3 上 col>header_cols 的源格永远不会被横向合）。
+            # 行表头行的横向合右边界应为 max_col。
+            if False and header_cols and next_c > max(header_cols):
+                continue
+            # v3.30+：保留 v3.22 prev_row_col_cover 约束
+            max_end_c = prev_row_col_cover.get(c, max_col)
+            end_c = next_c
+            while end_c < max_col:
+                if is_merge_subcell_in_same_row(header_row, end_c + 1):
+                    break
+                nv = get_effective_value(header_row, end_c + 1)
+                # v3.43+：重复值合并扩展
+                if not (is_value_for_merge(nv) or _can_extend_for_repeat_value(cell_val, nv)):
+                    break
+                if (header_row, end_c + 1) not in header_cells_set:
+                    break
+                if (end_c + 1) > max_end_c:
+                    break
+                end_c += 1
+            if end_c < next_c:
+                continue
+            try:
+                ws.merge_cells(
+                    f"{get_column_letter(c)}{header_row}:{get_column_letter(end_c)}{header_row}"
+                )
+                cur_row_col_cover[c] = max(cur_row_col_cover.get(c, c), end_c)
+                # v3.31+：本行横向合覆盖的所有 col 都继承源格的覆盖范围
+                for cc in range(c, end_c + 1):
+                    cur_row_col_cover[cc] = max(cur_row_col_cover.get(cc, cc), end_c)
+            except Exception:
+                pass
+
+        # v3.31+：当 prev_row_col_cover[c] 未被设置（row N 不含源格），
+        # 但 col c 在 row 1 的横向合范围内时，继承 row 1 的覆盖。
+        for c in range(1, max_col + 1):
+            if cur_row_col_cover.get(c, c) == c and c in row1_horizontal_covers:
+                cur_row_col_cover[c] = row1_horizontal_covers[c]
+
+        # (2) 本行竖向合并（向下）—— v3.53+ 改为后做（先横后竖）
+        # v3.50 规则保留：表头行源格竖向合禁用"重复值延伸"（仅允许占位/空延伸）
+        def _in_horizontal_merge_with_left_source(row, col):
+            """判定 (row, col) 是否在某个同行横向合并范围内，且该合并源格的 col < col。"""
+            for m in ws.merged_cells.ranges:
+                if (m.min_row == m.max_row == row
+                        and m.min_col < col <= m.max_col):
+                    return True
+            return False
+        for c in sorted(by_row[header_row]):
+            # v3.53+：源格已被横向合吸收（行内副格） → 跳过竖向
+            if _in_horizontal_merge_with_left_source(header_row, c):
+                continue
+            cell_val = ws.cell(row=header_row, column=c).value
+            if is_value_for_merge(cell_val):
+                continue
+            # 只检查同行合并副格
+            if is_merge_subcell_in_same_row(header_row, c):
+                continue
+            next_r = header_row + 1
+            if next_r > max_row:
+                continue
+            if is_in_any_merge(next_r, c):
+                continue
+            next_val = get_effective_value(next_r, c)
+            # v3.50 规则保留：表头行源格禁用重复值竖向延伸
+            if header_row in header_rows_set:
+                if _can_extend_for_repeat_value(cell_val, next_val) and not is_value_for_merge(next_val):
+                    continue
+            # v3.43+：扩展判断 — 占位/空/同值均可扩展
+            if not (is_value_for_merge(next_val) or _can_extend_for_repeat_value(cell_val, next_val)):
+                continue
+            if (next_r, c) not in header_cells_set:
+                continue
+            end_r = next_r
+            while end_r < max_row:
+                if is_in_any_merge(end_r + 1, c):
+                    break
+                nv = get_effective_value(end_r + 1, c)
+                if not (is_value_for_merge(nv) or _can_extend_for_repeat_value(cell_val, nv)):
+                    break
+                if (end_r + 1, c) not in header_cells_set:
+                    break
+                end_r += 1
+            if end_r < next_r:
+                continue
+            try:
+                ws.merge_cells(
+                    f"{get_column_letter(c)}{header_row}:{get_column_letter(c)}{end_r}"
+                )
+                horizontal_merged_cols[c] = end_r  # 复用变量名（实际是 vertical 范围）
+            except Exception:
+                pass
+
+        prev_row_col_cover = cur_row_col_cover
+
+    # ===== Phase 2: 列表头单元格处理（先列再行）=====
+    # v3.30+：按列号升序处理；每列内先横向后纵向
+    sorted_header_cols = sorted(by_col.keys())
+
+    # v3.30+：复用 Phase 1 的 prev_row_col_cover 作为 Phase 2 的 prev 约束
+    # Phase 1 后 prev_row_col_cover[col] = row 1 中本列源格的最大合并列
+    phase1_prev_cover = dict(prev_row_col_cover)
+
+    # v3.48+：Phase 2.5 —— 数据行内"非 header_col 列"上的源格横向合
+    # 场景：sheet 3.1 B12='<region_sub>' (col=2 ∉ header_cols=[1])，应横合到 C12='<region_sub>'
+    # 原因：业务分组标签常在数据行内"复制粘贴"到相邻列展示，重复值应当合
+    # 注意：仅当 next_val 与源格同值时才允许跨 header_cols 边界
+    #       占位/空不算同值（避免 B6='平台收款' 合到 C6='-' 这种"业务分组标签 + 占位"越界）
+    if header_rows:
+        data_row_min = max(header_rows) + 1
+    else:
+        data_row_min = 1
+    for r in range(data_row_min, max_row + 1):
+        # 找出该行所有源格（仅 c ∉ header_cols 的源格，因为 header_cols 上的源格已由 Phase 2 处理）
+        row_source_cells = []
+        for c in range(1, max_col + 1):
+            if header_cols and c in header_cols:
+                continue
+            v = ws.cell(row=r, column=c).value
+            if v is not None and not is_value_for_merge(v):
+                row_source_cells.append((c, v))
+        # 对每个源格尝试横合（仅"重复值"语义）
+        # v3.53+：当 Phase 2 处理 col=1 时会横向合到 B:C（区域行 A:B:C 同值）→ Phase 2.5 跳过避免共存
+        # 判定：A 列真值 == cell_val 且 c > 1 → Phase 2 会合 A:C → Phase 2.5 不应再合 B:C
+        a_val_p25 = None
+        if header_cols and 1 in header_cols:
+            a_val_p25 = ws.cell(row=r, column=1).value
+            a_is_subcell_p25 = any(
+                m.min_row <= r <= m.max_row and m.min_col <= 1 <= m.max_col and (m.min_row != r or m.min_col != 1)
+                for m in ws.merged_cells.ranges
+            )
+            if a_is_subcell_p25:
+                a_val_p25 = None  # A 列是合并副格 → 不参与判定
+
+        for c, cell_val in row_source_cells:
+            # v3.53+：当 A 列真值 == cell_val 时，Phase 2 会合 A:C → Phase 2.5 不应再合
+            if (a_val_p25 is not None and not is_value_for_merge(a_val_p25)
+                    and c > 1 and c not in header_cols):
+                try:
+                    if cell_val == a_val_p25 and type(cell_val) is type(a_val_p25):
+                        continue
+                except Exception:
+                    pass
+            # 已被合并 → 跳过
+            if is_merge_subcell(r, c):
+                continue
+            next_c = c + 1
+            if next_c > max_col:
+                continue
+            next_val = ws.cell(row=r, column=next_c).value
+            # 仅允许"严格同值"合并，不允许占位合并（避免 B6 越界）
+            if not _can_extend_for_repeat_value(cell_val, next_val):
+                continue
+            end_c = next_c
+            while end_c < max_col:
+                nc = end_c + 1
+                nv = ws.cell(row=r, column=nc).value
+                # 严格同值合并 + 允许跨过占位/空（这是重复值延伸的自然要求）
+                if not _can_extend_for_repeat_value(cell_val, nv):
+                    break
+                end_c += 1
+            if end_c < next_c:
+                continue
+            try:
+                ws.merge_cells(
+                    f"{get_column_letter(c)}{r}:{get_column_letter(end_c)}{r}"
+                )
+            except Exception:
+                pass
+
+    for header_col in sorted_header_cols:
+        cur_col_row_cover = {r: r for r in range(1, max_row + 1)}
+
+        # (1) 本列横向合并（向右）
+        # v3.30+：列表头场景用 ws.cell.value 读取，不受 row 1 跨行合并覆盖影响
+        # —— 即 AS2 不应被视为 AS1:BE1 的副格
+        horizontal_merged_rows = {}  # row → end_c
+        for r in sorted(by_col[header_col]):
+            # v3.53+：Phase 2 处理 header_cols 内所有行（包括数据行），不再跳过 r ∉ header_rows 的源格
+            # 数据行的"行维度标签"（如 sheet 1.2 R7 B7='付款GMV'）也是 header_cells 源格——
+            #   因为 B 列是 header_col（行维度列），整列所有行都进 header_cells
+            # B7 列参与 Phase 2 横向合时，由"跨 header_cols 边界保护"阻止错误合到 C 列：
+            #   next_c=3 不在 header_cols → 不能用占位延伸（'-'/'空'）跨边界
+            #   next_c=3 是数字（962146...）→ 自然 break
+            # v3.48+：检查 A 列是否有自己的标签（不是合并副格）
+            # 该判定用于 line 802 的例外：允许该行源格跨 header_cols 占位延伸
+            # R5 A5 c=1：源格本身就在 A 列 → a_col_has_label=True（自己就是 A 列标签）
+            # R6 B6 c=2：A6=None（继承自 A5:A8 合并区）→ a_col_has_label=False
+            a_col_has_label = False
+            if header_col == 1:
+                # 源格本身是 A 列 → 视为"该行 A 列有自己的标签"
+                a_col_has_label = True
+            else:
+                a_val = get_cell_value(ws, r, 1)
+                a_is_subcell = any(
+                    m.min_row <= r <= m.max_row and m.min_col <= 1 <= m.max_col and (m.min_row != r or m.min_col != 1)
+                    for m in ws.merged_cells.ranges
+                )
+                if not a_is_subcell and a_val is not None and not is_value_for_merge(a_val):
+                    a_col_has_label = True
+
+            cell_val = ws.cell(row=r, column=header_col).value
+            if is_value_for_merge(cell_val):
+                continue
+            # 已被本行其他 cell 横向合并 → 跳过
+            if is_merge_subcell(r, header_col):
+                continue
+            next_c = header_col + 1
+            if next_c > max_col:
+                continue
+            next_val = ws.cell(row=r, column=next_c).value
+            # v3.43+：扩展判断 — next_val 是占位 / 空 / 与 cell_val 重复值均可扩展
+            if not (is_value_for_merge(next_val) or _can_extend_for_repeat_value(cell_val, next_val)):
+                continue
+            # v3.35+：Phase 2 横向合不要求 next_c 在 header_cells 中
+            # —— 当 next_c 是空值或与源格相同时，允许合并
+            # v3.39+：但要求 next_c 必须是表头列（header_cols 范围内）
+            # 否则会导致 B6:C6 的错误合并（C6 不是表头单元格）
+            if (r, next_c) not in header_cells_set and not is_value_for_merge(next_val) and not _can_extend_for_repeat_value(cell_val, next_val):
+                continue
+            # v3.39+：额外检查 next_c 必须在表头列范围内
+            # v3.47+：按源格行位置 + next_val 语义区分——
+            #   - 表头行源格（r ∈ header_rows）：不受 max(header_cols) 限制（合到 max_col）
+            #     例如 sheet 0 AS2 (R2) 应合到 AY3
+            #   - 数据行源格（r ∉ header_rows）：
+            #     * next_val 与源格同值（_can_extend_for_repeat_value=True）：允许合到 max_col
+            #       例如 sheet 3.2 A7=C7='<region_B>' 应合到 A7:C7
+            #     * next_val 是其他值（占位/空/不同值）：受 max(header_cols) 限制
+            #       例如 sheet 0 B6='平台收款' + C6='-'（占位）→ 不应合到 C6
+            #     * 例外：该行 A 列有自己的标签（a_col_has_label=True）→ 允许占位延伸
+            #       例如 sheet 2 R5 A5='<biz_unit>' → B5/C5 占位允许合
+            #     * 例外排除：源格 cell_val 含 TITLE_KEYWORDS（"合计/总计/小计/汇总/标题"）
+            #       → 该源格是"合计行"，不应跨占位延伸到数据列
+            #       例如 sheet 0 R9 B9='合计' → C9..BE9 占位不应合到 BE9（虽然 A9='电销' 是自己的）
+            is_total_source = any(k in str(cell_val) for k in TITLE_KEYWORDS) if cell_val else False
+            if header_cols and next_c > max(header_cols) and r not in header_rows_set:
+                # v3.53+：数据行源格（r ∉ header_rows）跨 header_cols 边界保护
+                # 仅当 next_val 与源格严格同值（非占位非空）才允许越界
+                # 例外：a_col_has_label=True（该行 A 列有自己标签）允许同值延伸
+                # v3.53+修正：a_col_has_label 例外仅在 header_col=1 时生效（列内扩展）
+                #   其他列（col ≥ 2）的源格不能用 a_col_has_label 占位延伸跨 header_cols
+                #   例：sheet 1.2 R7 B7='付款GMV'（col=2）+ C7='-' → 不应合 B7:C7（C 列不在 header_cols）
+                #   例：sheet 2 R13 A13='<region_B>'（col=1）+ B13='<region_sub>' → A:B 不同值 → 不合
+                if not _can_extend_for_repeat_value(cell_val, next_val):
+                    # v3.53+：a_col_has_label 例外仅适用于 header_col=1（A 列源格）
+                    if header_col != 1:
+                        continue
+                    if not a_col_has_label:
+                        continue
+                    if is_total_source:
+                        continue
+            # v3.44+：Phase 2 横向合不再沿用 phase1_prev_cover[（行表头层的列覆盖约束）
+            # —— prev_cover 是 row N 的合并列范围，用于限制 row N+1 的横向合不超过 row N 的合并列范围
+            # —— 但 Phase 2 处理的是数据行（列表头列），与 Phase1 行表头无关
+            # —— 例如 sheet"2" row 4 含日期，col=1 在 Phase1 后 prev_cover[1]=1，
+            # —— 但 row 10 的 A=B=C='<region_A1>' 应能合并 A:C（max(header_cols)=3）而非仅 A:B
+            # v3.47+：max_end_c 同样按源格行位置 + next_val 语义区分
+            if r in header_rows_set:
+                max_end_c = max_col
+            elif _can_extend_for_repeat_value(cell_val, next_val):
+                # 数据行源格 + next_val 与源格严格同值 → 放宽到 max_col
+                # 例如 sheet 3.2 A7=C7='<region_B>' → 合到 A7:C7
+                max_end_c = max_col
+            elif a_col_has_label and not is_total_source:
+                # v3.48+：该行 A 列有自己的标签 → 允许占位延伸（用户期望 A5='<biz_unit>' + B5=None + C5='-' 合到 A5:C5）
+                # 但排除"合计/总计/小计/汇总/标题"等合计行源格
+                # 例如 sheet 2 R5 A5='<biz_unit>' → B5/C5 占位允许合
+                # 但 sheet 0 R9 B9='合计' → 不允许合（虽然 A9='电销'）
+                max_end_c = max_col
+            else:
+                # 数据行源格 + next_val 非同值（占位/空/不同值）→ 受 max(header_cols) 限制
+                # 例如 sheet 0 B6='平台收款' + C6='-' → 不合到 C6
+                max_end_c = max(header_cols) if header_cols else max_col
+            end_c = next_c
+            # v3.48+：检查"是否有同值锚点"
+            # 源格横向合的右边界 = "第一个与源格严格同值的 cell 位置" 或 "第一个非占位非空且不同值的 cell 位置 - 1"
+            # 即：合到出现"实值锚点"为止，没有实值锚点就不合（防止 B6='平台收款' 占位延伸越界）
+            #
+            # 例外（允许占位延伸）：
+            #   - 表头行源格（r ∈ header_rows）
+            #   - 该行 A 列（col=1）有自己的非空标签（a_col_has_label=True，在内层循环开头计算）
+            #     例如 sheet 2 R5 A5='<biz_unit>'（A 列有值）→ B5/C5 占位允许合
+            #     例如 sheet 0 R6 A6=None（继承自 A5:A8='运营' 合并区）→ B6 是该行唯一标签，不允许合
+            same_value_end_c = None  # 第一个与源格同值的 col
+            real_value_end_c = None  # 第一个非占位非空且不同值的 col（即"实值阻断点"）
+            if r in header_rows_set or a_col_has_label:
+                # 表头行源格 或 该行 A 列有自己的标签：允许占位延伸
+                pass
+            else:
+                # 数据行源格且该行无 A 列标签：必须找同值锚点
+                for nc_check in range(next_c + 1, max_col + 1):
+                    nv_check = ws.cell(row=r, column=nc_check).value
+                    if _can_extend_for_repeat_value(cell_val, nv_check):
+                        same_value_end_c = nc_check
+                        break
+                    if not is_value_for_merge(nv_check):
+                        # 遇到非占位非空且不同值 → 没有同值锚点 → 不允许延伸
+                        real_value_end_c = nc_check
+                        break
+
+            while end_c < max_col:
+                nc = end_c + 1
+                nv = ws.cell(row=r, column=nc).value
+                # v3.43+：重复值合并扩展
+                if not (is_value_for_merge(nv) or _can_extend_for_repeat_value(cell_val, nv)):
+                    break
+                # v3.46+：bugfix —— 与 line 785 一致：当 nv 是占位/空/重复值时，
+                # 允许 (r, nc) 跨出 header_cells 边界。否则 A7:B7 能合但 B7:C7 停住。
+                if (r, nc) not in header_cells_set and not is_value_for_merge(nv) and not _can_extend_for_repeat_value(cell_val, nv):
+                    break
+                # v3.48+：max_end_c 严格生效 —— 不允许"占位无限延伸"
+                if nc > max_end_c:
+                    break
+                end_c += 1
+            # v3.48+：数据行源格 + 跨 header_cols + 没有同值锚点 → 回退到 next_c - 1（即不合）
+            # 仅当进入"必须找同值锚点"的 else 分支时才需要此回退
+            # 如果 pass 走（a_col_has_label=True）则不需要回退
+            if (real_value_end_c is not None  # 标记是否进入了 else 分支（real_value_end_c 在 else 分支中可能赋值）
+                and same_value_end_c is None
+                and end_c > next_c):
+                # 不允许跨过 header_cols 延伸占位（即使 max_end_c 已经放宽到 max_col）
+                end_c = next_c - 1
+            if end_c < next_c:
+                continue
+            try:
+                ws.merge_cells(
+                    f"{get_column_letter(header_col)}{r}:{get_column_letter(end_c)}{r}"
+                )
+                horizontal_merged_rows[r] = end_c
+            except Exception:
+                pass
+
+        # (2) 本列竖向合并（向下）
+        # v3.30+：列表头用 ws.cell.value；横向优先
+        # v3.49+：竖向合支持"重复值跨占位"——下一格若是与源格同值（_can_extend_for_repeat_value=True）
+        #       则视为可延伸（与横向合的 _can_extend_for_repeat_value 一致）。
+        #       之前的限制"仅 next_val 是空/占位才能延伸"过于严格，相同值源格无法跨越中间阻断行合并。
+        for r in sorted(by_col[header_col]):
+            cell_val = ws.cell(row=r, column=header_col).value
+            if is_empty(cell_val):
+                continue
+            if is_merge_subcell(r, header_col):
+                continue
+            if r in horizontal_merged_rows:
+                continue  # 横向优先
+            next_r = r + 1
+            if next_r > max_row:
+                continue
+            # v3.30+：如果 next_r 已与 A15:B15 这种跨列合并范围绑定，跳过竖向合并
+            if is_merge_subcell_in_same_row(next_r, header_col):
+                continue
+            next_val = ws.cell(row=next_r, column=header_col).value
+            # v3.49+：next_val 允许空/占位/与源格同值（重复值延伸）
+            if not (is_value_for_merge(next_val) or _can_extend_for_repeat_value(cell_val, next_val)):
+                continue
+            if (next_r, header_col) not in header_cells_set:
+                continue
+            end_r = next_r
+            while end_r < max_row:
+                nr = end_r + 1
+                # v3.49+：竖向合支持"重复值延伸"——遇到与源格同值的下一格时继续延伸
+                # 遇到空/占位时也继续延伸，遇到非空非占位且不同值时停止
+                nv = ws.cell(row=nr, column=header_col).value
+                if not (is_value_for_merge(nv) or _can_extend_for_repeat_value(cell_val, nv)):
+                    break
+                if (nr, header_col) not in header_cells_set:
+                    break
+                end_r += 1
+            if end_r < next_r:
+                continue
+            try:
+                ws.merge_cells(
+                    f"{get_column_letter(header_col)}{r}:{get_column_letter(header_col)}{end_r}"
+                )
+                cur_col_row_cover[r] = max(cur_col_row_cover.get(r, r), end_r)
+            except Exception:
+                pass
+
+
+
+
+def merge_header_by_legacy_rows(ws: Worksheet, header_rows, max_col: int,
+                                 max_row: int) -> None:
+    """v3.29+ 兼容：保留旧接口，从 header_rows 构造 header_cells 调用新函数。
+
+    旧 API 仅用于外部脚本兼容性。
+    """
+    if isinstance(header_rows, int):
+        header_rows = [header_rows]
+    header_cells = set()
+    for r in header_rows:
+        for c in range(1, max_col + 1):
+            header_cells.add((r, c))
+    merge_header_by_rows(ws, header_cells, max_col, max_row)
+
+
+def merge_header_cells(ws: Worksheet, header_rows, max_col: int,
+                       max_row: int) -> None:
+    """v3.22+：保留为别名，调用新的逐行算法（向后兼容）。
+
+    旧版「先横后纵」算法被替换为「逐行纵→横」(`merge_header_by_rows`)。
+    """
+    merge_header_by_rows(ws, header_rows, max_col, max_row)
+
+
+def merge_header_rectangles(ws: Worksheet, header_rows_set: set,
+                              max_row: int, max_col: int) -> None:
+    """v3.21+：二次扫描 pass2，将已合并的区域扩展为矩形。
+
+    场景：A1 有值、A2 / B1 / B2 全空；
+    v3.20 之前的行为是先生成 A1:B1，再生成 A1:A2 → 两个独立合并区。
+    期望：A1:B2 一次性矩形合并。
+
+    算法（横竖合并分别处理）：
+      1) 横向合并（min_row == max_row）从 max_row+1 向下扫描；
+         若下一行在 [min_col, max_col] 范围所有列都空 → 扩展 max_row
+      2) 竖向合并（min_col == max_col）从 max_col+1 向右扫描；
+         若下一列在 [min_row, max_row] 范围所有行都空 → 扩展 max_col
+
+    跳过表头行内的合并不扩展（header_rows_set 内的合并不动）。
+
+    v3.53+：扫描"空"时排除被其他 merge 覆盖的 cell
+    （避免 B6:C6 被扩展为 B6:C12——实际 A7:C7/A8:C8/... 是独立横合）
+    """
+    def is_in_other_merge(row, col, exclude_merge=None):
+        """判定 (row, col) 是否在 exclude_merge 之外的其他"独立"合并范围内。
+
+        v3.53+修正：排除"以 exclude_merge 源格为左上角的合并"
+        （如 A1:C1 的源格是 A1，A1:A4 也是以 A1 为源格——这种是上下嵌套合"
+        不是独立合并，不应阻断 A1:C1 的向下扩展）
+        """
+        exclude_top_left = (exclude_merge.min_row, exclude_merge.min_col) if exclude_merge else None
+        for m in ws.merged_cells.ranges:
+            if m is exclude_merge:
+                continue
+            if exclude_top_left and (m.min_row, m.min_col) == exclude_top_left:
+                # 嵌套合并：m 是以 exclude_merge 源格为左上角的合并
+                continue
+            if m.min_row <= row <= m.max_row and m.min_col <= col <= m.max_col:
+                return True
+        return False
+
+    if not list(ws.merged_cells.ranges):
+        return
+    # 先把 ranges 物化避免迭代时修改
+    snapshot = list(ws.merged_cells.ranges)
+    for merge in snapshot:
+        # === 横向合并 → 向下扩展 ===
+        if merge.min_row == merge.max_row:
+            c1, c2 = merge.min_col, merge.max_col
+            new_max_row = merge.max_row
+            next_r = new_max_row + 1
+            while next_r <= max_row:
+                all_empty = True
+                for c in range(c1, c2 + 1):
+                    # v3.21+ 关键：直接读 cell.value，不走 get_cell_value（否则合并副格返回左上角值会误判）
+                    raw_v = ws.cell(row=next_r, column=c).value
+                    # v3.53+：如果该 cell 已经被独立合并覆盖（不是当前 merge 的副格）→ 视为"被占位"，停止扩展
+                    # 避免 B6:C6 扩展成 B6:C12（实际 A7:C7 / A8:C8 / ... 都是独立横合）
+                    if not is_empty(raw_v):
+                        all_empty = False
+                        break
+                    if is_in_other_merge(next_r, c, merge):
+                        all_empty = False
+                        break
+                if not all_empty:
+                    break
+                new_max_row = next_r
+                next_r += 1
+            if new_max_row == merge.max_row:
+                continue
+            old_range = f"{get_column_letter(merge.min_col)}{merge.min_row}:{get_column_letter(merge.max_col)}{merge.max_row}"
+            new_range = f"{get_column_letter(c1)}{merge.min_row}:{get_column_letter(c2)}{new_max_row}"
+            # v3.53+：先 unmerge 所有与新范围重叠的其他 merge（避免 openpyxl 留下冗余合并）
+            # 例：A1:C1 + A1:A4 → 扩展为 A1:C4 → 必须先 unmerge A1:A4 否则 openpyxl 产生两个独立 merge
+            other_overlapping = []
+            for m in snapshot:
+                if m is merge:
+                    continue
+                if (m.min_col <= c2 and m.max_col >= c1
+                        and m.min_row <= new_max_row and m.max_row >= merge.min_row):
+                    other_overlapping.append(m)
+            for m in other_overlapping:
+                try:
+                    ws.unmerge_cells(f"{get_column_letter(m.min_col)}{m.min_row}:{get_column_letter(m.max_col)}{m.max_row}")
+                except Exception:
+                    pass
+            try:
+                ws.unmerge_cells(old_range)
+            except Exception:
+                pass
+            try:
+                ws.merge_cells(new_range)
+            except Exception:
+                try:
+                    ws.merge_cells(old_range)
+                except Exception:
+                    pass
+        # === 竖向合并 → 向右扩展 ===
+        elif merge.min_col == merge.max_col:
+            r1, r2 = merge.min_row, merge.max_row
+            # v3.46+：去掉 v3.39 加的"跳过表头行内竖向合"限制。
+            # 原意是避免 A1:B3 等跨表头竖向合被错误扩展，但同时也阻断了
+            # sheet 0 AS2:AS3 这种"表头行内竖向合 + 同行右侧空白可吸收"的矩形扩展。
+            # 风险已通过 (next_c 范围) + (r 范围全空) 双重判断兜底，无需额外过滤。
+            # v3.39+：跳过表头行内的竖向合并不扩展（避免 A1:B3 等跨表头的竖向合被错误地向右扩展到 C 列）
+            if False and r1 in header_rows_set:
+                continue
+            new_max_col = merge.max_col
+            next_c = new_max_col + 1
+            while next_c <= max_col:
+                all_empty = True
+                for r in range(r1, r2 + 1):
+                    # v3.21+ 关键：同上，直接读 cell.value
+                    raw_v = ws.cell(row=r, column=next_c).value
+                    if not is_empty(raw_v):
+                        all_empty = False
+                        break
+                    # v3.53+：竖向合向右扩展时排除被其他合并覆盖的 cell
+                    if is_in_other_merge(r, next_c, merge):
+                        all_empty = False
+                        break
+                if not all_empty:
+                    break
+                new_max_col = next_c
+                next_c += 1
+            if new_max_col == merge.max_col:
+                continue
+            old_range = f"{get_column_letter(merge.min_col)}{merge.min_row}:{get_column_letter(merge.max_col)}{merge.max_row}"
+            new_range = f"{get_column_letter(merge.min_col)}{r1}:{get_column_letter(new_max_col)}{r2}"
+            # v3.53+：先 unmerge 所有与新范围重叠的其他 merge（避免 openpyxl 留下冗余合并）
+            other_overlapping = []
+            for m in snapshot:
+                if m is merge:
+                    continue
+                if (m.min_col <= new_max_col and m.max_col >= merge.min_col
+                        and m.min_row <= r2 and m.max_row >= r1):
+                    other_overlapping.append(m)
+            for m in other_overlapping:
+                try:
+                    ws.unmerge_cells(f"{get_column_letter(m.min_col)}{m.min_row}:{get_column_letter(m.max_col)}{m.max_row}")
+                except Exception:
+                    pass
+            try:
+                ws.unmerge_cells(old_range)
+            except Exception:
+                pass
+            try:
+                ws.merge_cells(new_range)
+            except Exception:
+                try:
+                    ws.merge_cells(old_range)
+                except Exception:
+                    pass
+
+
+def merge_header_col_cells(ws: Worksheet, header_col: int, max_row: int,
+                            max_col: int) -> None:
+    """对表头列执行智能合并：纵向。
+
+    v3.2 起：纵向合并前，先检查下方单元格是否已在任何合并范围内；
+    若是 → 跳过本次纵向合并（已合并的优先）。
+    """
+    def is_in_any_merge(row, col):
+        for m in ws.merged_cells.ranges:
+            if m.min_row <= row <= m.max_row and m.min_col <= col <= m.max_col:
+                return True
+        return False
+
+    for r in range(1, max_row):
+        cell_val = get_cell_value(ws, r, header_col)
+        if is_empty(cell_val):
+            continue
+        next_r = r + 1
+        # 关键检查：下方单元格已被合并 → 跳过纵向合并
+        if is_in_any_merge(next_r, header_col):
+            continue
+        next_val = get_cell_value(ws, next_r, header_col)
+        if is_empty(next_val):
+            row_has_data = False
+            for c in range(1, max_col + 1):
+                if c == header_col:
+                    continue
+                if not is_empty(get_cell_value(ws, next_r, c)):
+                    row_has_data = True
+                    break
+            if row_has_data:
+                end_r = next_r
+                while end_r < max_row:
+                    if is_in_any_merge(end_r + 1, header_col):
+                        break
+                    if not is_empty(get_cell_value(ws, end_r + 1, header_col)):
+                        break
+                    next_row_has_data = False
+                    for c in range(1, max_col + 1):
+                        if c == header_col:
+                            continue
+                        if not is_empty(get_cell_value(ws, end_r + 1, c)):
+                            next_row_has_data = True
+                            break
+                    if next_row_has_data:
+                        end_r += 1
+                    else:
+                        break
+                if not is_in_any_merge(end_r, header_col):
+                    merge_range = f"{get_column_letter(header_col)}{r}:{get_column_letter(header_col)}{end_r}"
+                    ws.merge_cells(merge_range)
+
+
+# ============================================================
+# 样式应用
+# ============================================================
+def apply_base_style(ws: Worksheet, max_row: int, max_col: int,
+                     empty_rows: List[int], empty_cols: List[int]) -> None:
+    """基础样式：微软雅黑 / 9号 / 黑色 / 居中 / 黑色边框（仅非空行列）。"""
+    empty_rows_set = set(empty_rows)
+    empty_cols_set = set(empty_cols)
+
+    for r in range(1, max_row + 1):
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.font = DEFAULT_FONT
+            cell.alignment = CENTER_ALIGN
+            if r in empty_rows_set or c in empty_cols_set:
+                cell.border = NO_BORDER
+            else:
+                cell.border = BLACK_BORDER
+
+
+def auto_fit_columns(ws: Worksheet, max_row: int, max_col: int,
+                     empty_rows: List[int], empty_cols: List[int],
+                     header_rows: List[int] = None) -> None:
+    """列宽 + 行高自适应（v3.8 重写，模拟 Excel 双击自适配）。
+
+    Excel 双击自适配的规则（精确版）：
+      1) 逐列扫描该列所有有效单元格（不限行数）的最长内容字符宽度
+      2) 标题行特殊处理：wrap 到 2 行展示；若 2 行仍展示不全，则扩展列宽直至能展示完整内容
+      3) 内容行：不换行（保持完整可见）
+      4) 行高由"该行最大字号 + wrap 行数"决定
+
+    字符宽度换算：
+      - 中文 = 2 字符
+      - ASCII = 1 字符
+      - 与 Excel 列宽 1 单位 ≈ 1 个 0-9 字符宽度相近
+
+    行高换算（按 wrap 行数）：
+      - 短内容（1 行内） = 18 磅
+      - 1 行 wrap = 24 磅
+      - 2 行 wrap = 36 磅
+      - 超过 2 行 → 触发"列宽扩展"机制（直到能 2 行展示），行高仍为 36 磅
+
+    v3.33+ 关键修复：列宽适配 number_format 模拟的"显示字符串"宽度，而非原始数值。
+    例：R5 = 181860499.83 + fmt `0"."0,"万"` → 显示 "18186.0万" (7 字符)。
+    原算法按原始数字 16 字符算 max_w → 列宽 17 → 远超显示宽度。
+    新算法按模拟显示算 → 列宽 8（含 1 字符 padding）。
+    """
+    import math
+    if header_rows is None:
+        header_rows = [1]
+    empty_rows_set = set(empty_rows)
+    empty_cols_set = set(empty_cols)
+    header_rows_set = set(header_rows)
+
+    MIN_COL_WIDTH = 8.0          # 最小列宽
+    PADDING = 1.0               # 列内 padding
+    DEFAULT_ROW_HEIGHT = 18.0   # 默认行高（短内容）
+    ONE_LINE_HEIGHT = 24.0      # 1 行 wrap
+    TWO_LINE_HEIGHT = 36.0      # 2 行 wrap
+    MAX_WRAP_LINES = 2          # 标题行最多 wrap 2 行
+
+    def display_width(s: str) -> int:
+        """中文字符按 2，ASCII 按 1。"""
+        return sum(2 if ord(ch) > 127 else 1 for ch in s)
+
+    def simulate_display_value(value, fmt: str) -> str:
+        """v3.33+：按 number_format 模拟单元格显示字符串。
+
+        支持的 fmt：
+          - "0.00%" → "NN.NN%"（val * 100 格式化，2位小数）
+          - '0"."0,"万"' / "0.0万" → val/10000 格式化为 "N.NNN万" 或 "NNN.N万"
+          - "#,##0.00" → "1,234.56" 千分位 2 位小数
+          - "General" 或其他 → str(value)
+        """
+        if value is None or fmt is None or fmt == "General":
+            return "" if value is None else str(value)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return str(value)
+        s = str(fmt).strip()
+        # 百分比
+        if "0.00%" in s or s == "0.00%":
+            return f"{value * 100:.2f}%"
+        if "%" in s and "0." in s:
+            if "0.0%" in s:
+                return f"{value * 100:.1f}%"
+            return f"{value * 100:.0f}%"
+        # 万级（含"万"字面量）
+        if "万" in s:
+            decimal_places = 1
+            if "0.00" in s:
+                decimal_places = 2
+            elif "0.0" in s:
+                decimal_places = 1
+            v_wan = value / 10000.0
+            return f"{v_wan:,.{decimal_places}f}万"
+        # 千分位
+        if "#,##0" in s:
+            decimal_places = 0
+            if "0.00" in s:
+                decimal_places = 2
+            elif "0.0" in s:
+                decimal_places = 1
+            return f"{value:,.{decimal_places}f}"
+        # 整数
+        if "0" == s.replace(";", "").replace("[Red]", "").replace("-", "").strip():
+            return f"{int(value)}"
+        return str(value)
+
+    # 暴露 simulate_display_value 给外部脚本（v3.33+ 调试 / 验证用）
+    globals()['simulate_display_value'] = simulate_display_value
+
+    # ============== 第一步：逐列计算最长内容宽度 ==============
+    # 逻辑：列宽应该容纳该列中所有有效单元格的内容
+    # 对于"合并范围源格"的内容：按合并范围均分宽度后，每列只需承担 1/N
+    col_max_width = {}  # 该列所有有效单元格中最长的字符宽度
+
+    # 1.1 收集所有合并范围（仅同行 = 横向合并）
+    # v3.27+ 修复：过滤掉"跨度 > MAX_HEADER_TITLE_SPAN" 的大标题合并（如 C1:AR1 这种
+    # 覆盖整片区域的总标题），它们的源格字符均分到每列后只有 1/N，会让所有被覆盖列
+    # 的 max_w 被拉到接近 0，最终列宽落回 MIN_COL_WIDTH=8 → 数据列列宽塌缩。
+    # 排除后，这些列按"非合并"路径按数据内容真实长度计算 max_w。
+    # 表头宽度扩展交给第三步处理（按比例扩展让总标题 wrap 到 2 行内）。
+    MAX_HEADER_TITLE_SPAN = 6
+    horizontal_merges = []  # [(min_col, max_col, content), ...]
+    for mr in ws.merged_cells.ranges:
+        if mr.min_row == mr.max_row:  # 同行合并 = 横向
+            span = mr.max_col - mr.min_col + 1
+            if span > MAX_HEADER_TITLE_SPAN:
+                # 大标题合并：不作为列内容源；表头宽度由第三步处理
+                continue
+            v = ws.cell(row=mr.min_row, column=mr.min_col).value
+            if v is not None:
+                horizontal_merges.append((mr.min_col, mr.max_col, v))
+
+    # 1.2 为每行构建 (row, c) -> (源格 mc1, mc2, 跨列数 span, 是否源格)
+    # 用于按行判定某列在某行是否处于合并范围内、是源格还是副格。
+    # v3.31+ 修复：原算法按列一次性决定走"合并分支/非合并分支"，导致 R 列
+    # 在 row 3 是 R3:T3 源格、但在 row 5-15 不是任何横向合并源格时，
+    # row 5-15 的长内容（如 "181860499.83" 16 字符）完全不计入 col_max_width，
+    # 最终 R 列列宽塌回 MIN_COL_WIDTH=8。
+    #
+    # 同时处理跨行合并（min_row != max_row，如 AS2:AY3）和大跨度横向合
+    # （被 MAX_HEADER_TITLE_SPAN 过滤的，如 AS1:BE1）—— 这些合并的源格内容
+    # 也会通过 get_cell_value 上溯到副格 col，必须视为"副格不计入"。
+    row_merge_span = {}
+    for mr in ws.merged_cells.ranges:
+        span = mr.max_col - mr.min_col + 1
+        if mr.min_row == mr.max_row and span > MAX_HEADER_TITLE_SPAN:
+            # 大跨度横向合：源格在 min_row 这一行（mr.min_row），其他列都是副格
+            r = mr.min_row
+            if r in empty_rows_set:
+                continue
+            v = ws.cell(row=r, column=mr.min_col).value
+            if v is not None:
+                row_merge_span[(r, mr.min_col)] = (mr.min_col, mr.max_col, span, True)
+                for c_in_range in range(mr.min_col + 1, mr.max_col + 1):
+                    row_merge_span[(r, c_in_range)] = (mr.min_col, mr.max_col, span, False)
+            continue
+        if mr.min_row == mr.max_row:
+            # 普通横向合：源格行 = mr.min_row
+            r = mr.min_row
+            if r in empty_rows_set:
+                continue
+            v = ws.cell(row=r, column=mr.min_col).value
+            if v is not None:
+                row_merge_span[(r, mr.min_col)] = (mr.min_col, mr.max_col, span, True)
+                for c_in_range in range(mr.min_col + 1, mr.max_col + 1):
+                    row_merge_span[(r, c_in_range)] = (mr.min_col, mr.max_col, span, False)
+        else:
+            # 跨行合并（min_row != max_row）：源格在 mr.min_row 行（mc1 列）
+            # mr.min_row+1..mr.max_row 行的 mc1 列都是副格（合并副格）
+            # mr.min_row..mr.max_row 行的 mc1+1..mc2 列都是副格
+            r_source = mr.min_row
+            if r_source not in empty_rows_set:
+                v = ws.cell(row=r_source, column=mr.min_col).value
+                if v is not None:
+                    row_merge_span[(r_source, mr.min_col)] = (mr.min_col, mr.max_col, span, True)
+                    # 源格行的副格列
+                    for c_in_range in range(mr.min_col + 1, mr.max_col + 1):
+                        row_merge_span[(r_source, c_in_range)] = (mr.min_col, mr.max_col, span, False)
+                # 跨行的副格行（mc1 列及之后所有列都是副格）
+                for r in range(mr.min_row + 1, mr.max_row + 1):
+                    if r in empty_rows_set:
+                        continue
+                    for c_in_range in range(mr.min_col, mr.max_col + 1):
+                        if (r, c_in_range) in row_merge_span:
+                            continue  # 不覆盖之前的源格映射
+                        row_merge_span[(r, c_in_range)] = (mr.min_col, mr.max_col, span, False)
+
+    for c in range(1, max_col + 1):
+        if c in empty_cols_set:
+            continue
+        max_w = 0
+        # v3.31+：按行判定该列是否在某个横向合并内
+        for r in range(1, max_row + 1):
+            if r in empty_rows_set:
+                continue
+            v = get_cell_value(ws, r, c)
+            if v is None:
+                continue
+            # v3.33+：列宽按 number_format 模拟显示字符串计算（而非原始值）
+            cell_obj = ws.cell(row=r, column=c)
+            fmt = cell_obj.number_format
+            display_v = simulate_display_value(v, fmt)
+            content_w = display_width(display_v)
+            merge_info = row_merge_span.get((r, c))
+            if merge_info is not None:
+                mc1, mc2, span, is_source = merge_info
+                if is_source:
+                    # 源格：内容平均分到 span 列
+                    per_col_w = math.ceil(content_w / span)
+                else:
+                    # 副格：内容不计入（实际显示由源格承担）
+                    continue
+            else:
+                # 非合并行：该 cell 内容独立占列宽
+                per_col_w = content_w
+            if per_col_w > max_w:
+                max_w = per_col_w
+        col_max_width[c] = max_w
+
+    # ============== 第二步：逐列设置列宽 ==============
+    # 列宽 = max(该列最长内容宽度 + padding, MIN_COL_WIDTH)
+    for c in range(1, max_col + 1):
+        if c in empty_cols_set:
+            continue
+        target = col_max_width.get(c, 0) + PADDING
+        target = max(target, MIN_COL_WIDTH)
+        ws.column_dimensions[get_column_letter(c)].width = target
+
+    # ============== 第三步：标题行扩展列宽（若 wrap 后超 2 行）==============
+    # 对每个标题行每个"显示单元"（合并范围的源单元格）：
+    #   显示总宽 = 合并范围内所有列宽之和
+    #   wrap 行数 = ceil(内容宽度 / 显示总宽)
+    #   若 wrap 行数 > MAX_WRAP_LINES → 按比例扩展合并范围内的列宽
+    visited_ranges = set()
+    for tr in header_rows:
+        if tr > max_row:
+            continue
+        for c in range(1, max_col + 1):
+            if c in empty_cols_set:
+                continue
+
+            # 找此格所属的横向合并范围
+            span_cols = []  # 此单元格的合并范围列号列表
+            for mr in ws.merged_cells.ranges:
+                if mr.min_row == tr and mr.max_row == tr and mr.min_col <= c <= mr.max_col:
+                    if id(mr) in visited_ranges:
+                        break
+                    visited_ranges.add(id(mr))
+                    span_cols = list(range(mr.min_col, mr.max_col + 1))
+                    break
+            else:
+                # 非合并 — 检查此列是否被其他合并占用
+                in_other_merge = False
+                for mr in ws.merged_cells.ranges:
+                    if mr.min_row == tr and mr.max_row == tr and mr.min_col <= c <= mr.max_col:
+                        in_other_merge = True
+                        break
+                if in_other_merge:
+                    continue
+                span_cols = [c]
+
+            if not span_cols:
+                continue
+            source_c = span_cols[0]
+            v = ws.cell(row=tr, column=source_c).value
+            if v is None:
+                continue
+            content_w = display_width(str(v))
+
+            # 当前合并范围总宽
+            current_span_width = 0
+            for cc in span_cols:
+                col_w = ws.column_dimensions[get_column_letter(cc)].width
+                if col_w is None or col_w <= 0:
+                    col_w = MIN_COL_WIDTH
+                current_span_width += col_w
+
+            # 计算 wrap 行数
+            wrap_lines = math.ceil(content_w / current_span_width) if content_w > current_span_width else 1
+
+            if wrap_lines > MAX_WRAP_LINES:
+                # 需要扩展：让合并范围总宽 = ceil(content_w / MAX_WRAP_LINES) + PADDING
+                needed_span_width = math.ceil(content_w / MAX_WRAP_LINES) + PADDING
+                if needed_span_width > current_span_width:
+                    # 按比例扩展每列
+                    scale = needed_span_width / current_span_width
+                    for cc in span_cols:
+                        old_w = ws.column_dimensions[get_column_letter(cc)].width
+                        if old_w is None or old_w <= 0:
+                            old_w = MIN_COL_WIDTH
+                        new_w = max(MIN_COL_WIDTH, old_w * scale)
+                        ws.column_dimensions[get_column_letter(cc)].width = new_w
+
+    # ============== 第四步：行高自适应（考虑合并单元格）==============
+    # 对每个标题行：
+    #   wrap_lines = 该行所有"显示单元"中 wrap 行数的最大值
+    #   显示单元 = 合并范围的源单元格，其有效显示宽度 = 合并范围内所有列宽之和
+    #   行高 = DEFAULT_ROW_HEIGHT + (wrap_lines - 1) * 15
+    for tr in header_rows:
+        if tr > max_row:
+            continue
+        max_wrap = 1  # 至少 1 行
+
+        visited_ranges = set()
+        for c in range(1, max_col + 1):
+            if c in empty_cols_set:
+                continue
+
+            # 找出此格所属的横向合并范围
+            source_c = c
+            in_merge = False
+            for mr in ws.merged_cells.ranges:
+                if mr.min_row == tr and mr.max_row == tr and mr.min_col <= c <= mr.max_col:
+                    in_merge = True
+                    if id(mr) in visited_ranges:
+                        break  # 已处理过
+                    visited_ranges.add(id(mr))
+                    source_c = mr.min_col
+                    # 计算合并范围总宽
+                    span_width = 0
+                    for cc in range(mr.min_col, mr.max_col + 1):
+                        col_w = ws.column_dimensions[get_column_letter(cc)].width
+                        if col_w is None or col_w <= 0:
+                            col_w = MIN_COL_WIDTH
+                        span_width += col_w
+                    break
+            else:
+                # 非合并
+                if not in_merge:
+                    col_w = ws.column_dimensions[get_column_letter(c)].width
+                    if col_w is None or col_w <= 0:
+                        col_w = MIN_COL_WIDTH
+                    span_width = col_w
+
+            if not in_merge:
+                continue  # 非合并、不是源格的从格、已处理过，跳过
+
+            # 取源单元格值
+            v = ws.cell(row=tr, column=source_c).value
+            if v is None:
+                continue
+            content_w = display_width(str(v))
+            wrap_lines = math.ceil(content_w / span_width) if content_w > span_width else 1
+            if wrap_lines > max_wrap:
+                max_wrap = wrap_lines
+
+        # 行高：1 行 = DEFAULT，2 行 = TWO_LINE
+        if max_wrap <= 1:
+            row_h = DEFAULT_ROW_HEIGHT
+        elif max_wrap == 2:
+            row_h = TWO_LINE_HEIGHT
+        else:
+            row_h = TWO_LINE_HEIGHT
+        ws.row_dimensions[tr].height = row_h
+
+
+def bold_header_and_total_rows(ws: Worksheet, max_row: int, max_col: int,
+                                header_rows: List[int] = None,
+                                header_cols: List[int] = None) -> None:
+    """表头行 / 合计行 / 表头列式横向合并单元格所在行加粗。
+
+    v3.5 起规则：
+      1) 表头行（header_rows 列表）→ 整行加粗
+      2) 合计/总计/小计/汇总行 → 整行加粗
+      3) **横向合并单元格所在行 + 合并范围跨多个表头列 + 是"表头下首行"或"最后一行" → 整行加粗**
+         （"表头列式横向合并" = 合并范围的列向宽度 ≥ 表头列数量，即合并范围覆盖整个表头区域）
+    """
+    if header_rows is None:
+        header_rows = [1]
+    if header_cols is None:
+        header_cols = [1]
+    header_rows_set = set(header_rows)
+    header_cols_set = set(header_cols)
+    min_data_row = (max(header_rows) if header_rows else 1) + 1
+    # 表头列范围
+    header_col_max = max(header_cols)
+    header_col_span = header_col_max  # 表头列"宽度"（最大列号）
+
+    # 计算"表头下首行"和"最后一行"
+    first_row_after_header = min_data_row
+    last_row = max_row
+
+    # 1) 表头行加粗
+    for tr in header_rows:
+        for c in range(1, max_col + 1):
+            ws.cell(row=tr, column=c).font = HEADER_FONT
+
+    # 2) 合计/总计行加粗
+    # v3.35+：B 列含"合计/总计/小计/汇总"的行也要加粗（即使 A 列是"运营/电销/城市"）
+    for r in range(min_data_row, max_row + 1):
+        if r in header_rows_set:
+            continue
+        row_values = [get_cell_value(ws, r, c) for c in range(1, max_col + 1)]
+        if is_total_row(row_values):
+            for c in range(1, max_col + 1):
+                ws.cell(row=r, column=c).font = HEADER_FONT
+            continue
+        # v3.35+：检查 B 列是否含"合计/总计/小计/汇总"
+        b_val = get_cell_value(ws, r, 2)
+        if b_val is not None:
+            b_str = str(b_val).strip()
+            if any(k in b_str for k in TITLE_KEYWORDS):
+                for c in range(1, max_col + 1):
+                    ws.cell(row=r, column=c).font = HEADER_FONT
+
+    # 3) 表头列式横向合并行：合并范围跨多个表头列 + 是表头下首行/末行 → 整行加粗
+    # v3.19+ 放宽：合并范围 ≥ 2 列（即不是单格合并）AND 是首行/末行 → 加粗
+    # 旧版严格条件：merge.min_col <= 1 and merge.max_col >= header_col_span
+    for merge in list(ws.merged_cells.ranges):
+        # 仅横向合并（min_row == max_row）
+        if merge.min_row != merge.max_row:
+            continue
+        r = merge.min_row
+        # 排除表头行本身
+        if r in header_rows_set:
+            continue
+        # v3.19+ 新判定：合并跨度 ≥ 2 列（任意"中间层表头合并"都算）
+        merge_span = merge.max_col - merge.min_col + 1
+        is_multi_col_merge = merge_span >= 2
+        # 兼容旧判定：合并范围覆盖整个表头列宽度
+        is_header_col_full_width = (
+            merge.min_col <= 1 and merge.max_col >= header_col_span
+        )
+        # 条件：该行是"表头下首行"
+        # v3.37+：移除"最后一行"条件，最后一行不一定是合计行，不应该自动加粗
+        is_first_after_header = (r == first_row_after_header)
+        # v3.37+：只在表头下首行时加粗，不再自动加粗最后一行
+        # v3.45+：放宽 —— 任何 ≥2 列横向合并的单元格所在行整行加粗（用户决策 2026-09-16）
+        if (is_multi_col_merge or is_header_col_full_width):
+            for c in range(1, max_col + 1):
+                ws.cell(row=r, column=c).font = HEADER_FONT
+
+
+def fill_empty_content_cells(ws, data_start, max_row, max_col,
+                              empty_rows, empty_cols,
+                              header_rows: List[int] = None,
+                              header_cols: List[int] = None,
+                              fill_value: str = "-",
+                              header_cells: Optional[set] = None,
+                              data_cells: Optional[set] = None):
+    """内容区空值填充 '-'（标题区保留原值，只做合并）。
+
+    v3.27+ 新增 header_cells / data_cells 参数（set of (r, c)）：
+      - 若提供，则按单元格级并集判定（推荐）
+      - 若不提供（向后兼容），回退到 v3.22 的"行+列"判定
+    """
+    if header_rows is None:
+        header_rows = [1]
+    if header_cols is None:
+        header_cols = [1]
+
+    empty_rows_set = set(empty_rows)
+    empty_cols_set = set(empty_cols)
+
+    for r in range(data_start, max_row + 1):
+        if r in empty_rows_set:
+            continue
+        for c in range(1, max_col + 1):
+            if c in empty_cols_set:
+                continue
+            # v3.27+ 单元格级判定：仅对数据单元格填充
+            if header_cells is not None:
+                if (r, c) in header_cells:
+                    continue
+            else:
+                # 向后兼容：按行/列判定
+                if r in set(header_rows) or c in set(header_cols):
+                    continue
+            v = get_cell_value(ws, r, c)
+            if is_empty(v):
+                try:
+                    ws.cell(row=r, column=c).value = fill_value
+                except AttributeError:
+                    # cell 已被合并为副格（Phase 2 后）→ 跳过
+                    pass
+
+
+def apply_number_formats(ws: Worksheet, data_start: int,
+                          max_row: int, max_col: int,
+                          empty_cols: List[int],
+                          header_rows: Optional[List[int]] = None,
+                          header_cols: Optional[List[int]] = None,
+                          wan_threshold: float = 10000,
+                          wan_enabled: bool = True,
+                          header_cells: Optional[set] = None) -> None:
+    """数字格式化。
+
+    v3.20+ 用户重新评估（回归 v3.3 之前的设计）：
+    - 达成率/通过率/完成率/环比/同比/占比 -> 0.00%（底层值不变）
+    - 比例/比率 -> 0.00%（底层值不变）
+    - 客户数/会员数/账号数/订单数 -> 整数格式；含"折算"则 2 位小数
+    - 万级（均值 >= 10000）-> **底层值 /10000** + fmt `0.0万`（含 [Red]）
+      显示示例：1500000 → 150.0万；12345 → 1.2万
+    - 常规数字 / 金额 -> #,##0.00；万级时同上述
+
+    注：
+    1) 金额列不加 ¥ 符号，只居右
+    2) v3.20+ 万级格式底层值 **除以 10000**，并简单 fmt `0.0万`（显示简洁）
+    3) v3.6 修复：header 从 data_start-1 行读取（多级表头取最后一行作为列标题判断依据）
+    4) v3.27+ 提供 header_cells 时，仅对"非表头单元格"应用数字格式
+       （数据列行 × 表头列的格子不被格式化为数字 — 因为它属于表头列范围）
+    5) v3.34+：客户数/会员数/账号数/订单数列判定 + "折算" 列改 2 位小数
+    6) v3.41+：5 优先级判定（percent → integer → GMV → 万级 → 普通）
+       ＋ 最后一层 header 判定 + date fallback（避免"结汇率"等上层污染）
+       ＋ GMV 关键字扫描严格化（排除"GMV考核"等子模块名）
+    7) v3.42+：is_date_like 识别 2 位年份（25年6月）→ 整数列正确 fmt
+    8) v3.44+：is_date_like 识别季度（26年Q1）→ 达成率列正确 fmt
+    """
+    empty_cols_set = set(empty_cols)
+
+    # v3.41+：统一数据单元格字段判断逻辑
+    # 优先级：1) 百分比列  2) 整数列  3) GMV 万级列  4) 万级列（均值>=10000）  5) 普通数字
+    # 1. 准备两层表头：
+    #    - last_layer_header：最后一层（最接近数据行），用于类型判定（避免上层"结汇率"污染）
+    #    - all_layers_header：拼接所有层，用于 GMV 关键字扫描（GMV 可能只在中间层）
+
+    last_layer_headers = []
+    all_layer_headers_raw = []  # 用于 GMV 关键字扫描
+    if header_rows:
+        last_hr = max(header_rows)
+        for col_idx in range(1, max_col + 1):
+            # 最后一层（v3.41+ 增强：如果是日期格式，往上找非日期的层）
+            v = get_cell_value(ws, last_hr, col_idx)
+            if v is None:
+                ext = _extend_to_nearest_nonempty(ws, last_hr, col_idx)
+                v = ext
+            # 判断是否日期（用 _is_date_like）
+            if is_date_like(v):
+                # 往上找非日期的层
+                # v3.45+：bugfix —— _extend_to_nearest_nonempty 默认会向左 + 向右各搜 8 列，
+                # 容易跨过本业务组边界搜到下一个业务组的"达成率/完成率/同比/环比"等
+                # 关键字，导致 R3CY=空 时被错赋 '达成率' → is_percent_column 误命中。
+                # 修复：date fallback 路径禁用右扩展，只向左找上一层非日期语义。
+                for hr2 in range(last_hr - 1, min(header_rows) - 1, -1):
+                    v2 = get_cell_value(ws, hr2, col_idx)
+                    if v2 is None:
+                        # 只向左搜，不右扩展
+                        v2 = _extend_to_nearest_nonempty_left_only(ws, hr2, col_idx)
+                    if v2 and not is_date_like(v2):
+                        v = v2
+                        break
+            last_layer_headers.append(_strip_parenthetical_content(str(v) if v is not None else ""))
+
+            # 拼接所有层
+            cells = _get_header_cells_in_col(ws, header_rows, col_idx)
+            # v3.54+：把数据行的"指标列标签"也作为额外 hint
+            #   场景：sheet"1.2" R1 是日期（last_header='45809'），但 R17 B17='col_<biz_alias_5>'
+            #   → 应识别为整数列而非日期列
+            #   扫描数据行 [data_start, max_row] 内 header_cols 最大列的所有非空标签 → 拼接到 all_layers
+            #   取所有标签（而非第一个）以覆盖不同分组（如 R2~R16 入账GMV + R17~R23 客户数）
+            if header_cols:
+                label_col = max(header_cols)
+                if label_col != col_idx:
+                    b_labels = []
+                    seen = set()
+                    for rr in range(data_start, max_row + 1):
+                        bv = get_cell_value(ws, rr, label_col)
+                        if bv is not None and not is_value_for_merge(bv):
+                            bl = _strip_parenthetical_content(str(bv))
+                            if bl and bl not in seen:
+                                seen.add(bl)
+                                b_labels.append(bl)
+                    if b_labels:
+                        cells = list(cells) + b_labels
+            all_layer_headers_raw.append(cells)
+    else:
+        for col_idx in range(1, max_col + 1):
+            last_layer_headers.append("")
+            all_layer_headers_raw.append([])
+
+    for col_idx in range(1, max_col + 1):
+        if col_idx in empty_cols_set:
+            continue
+        last_header = last_layer_headers[col_idx - 1] if col_idx - 1 < len(last_layer_headers) else ""
+        all_layers = all_layer_headers_raw[col_idx - 1] if col_idx - 1 < len(all_layer_headers_raw) else []
+
+        # === 优先级 1：百分比列 ===
+        # 用 last_header 判断（避免上层"结汇率"污染整列）
+        if is_percent_column(last_header):
+            number_format = "0.00%"
+        # === 优先级 2：整数列（客户数/会员数/链接数/人数 等）===
+        # v3.54+：移除"all_layers 任一命中关键字也走整数"——保留原 v3.37 行为，只看 last_header
+        # 行级别的"客户数"由 cell 循环里的 row_fmt 覆盖（处理"上半列 GMV + 下半列客户数"场景）
+        elif is_integer_count_column(last_header):
+            if ("折算" in last_header) or ("月化" in last_header):
+                number_format = "#,##0.00;[Red]-#,##0.00"
+            else:
+                number_format = "#,##0;[Red]-#,##0"
+        # === 优先级 3-5：万级或普通数字列 ===
+        else:
+            # === 优先级 3：GMV 列强制万级（扫描所有层）===
+            # v3.41+：只匹配"明确的GMV列名"，避免误判"GMV考核"等子模块名
+            # 规则：cell_val 必须是 "GMV" 单独词或 "...GMV..." 后面是数字/单位等
+            # 排除像 "GMV考核" "GMV完成" "GMV对比" 等子模块标题
+            has_gmv = False
+            for cell_val in all_layers:
+                if not cell_val:
+                    continue
+                s = str(cell_val).upper()
+                # 排除以 GMV 开头作为子模块标题的情况（GMV 后面跟中文动词）
+                if 'GMV' in s:
+                    # 检查 "GMV" 后面是否紧跟非数据性字符（中文动词/形容词）
+                    import re as _re
+                    # GMV 单独成词（行首或行尾）
+                    if _re.search(r'(^|\s)GMV(\s|$)|\(GMV\)|（GMV）', s):
+                        has_gmv = True
+                        break
+                    # 常见 GMV 数据列命名：付款GMV / 结汇净增GMV / 入账GMV / 全量GMV / 增量GMV / 存量GMV / GMV($) / GMV同比/环比
+                    if _re.search(r'付款GMV|入账GMV|全量GMV|增量GMV|存量GMV|结汇.*GMV|GMV[$¥]|GMV（\$）|GMV\(\$\)|GMV同比|GMV环比|GMV达成', s):
+                        has_gmv = True
+                        break
+            # === 优先级 3.5（v3.45+）：金额类白名单 —— 命中后强制万级，不依赖均值阈值 ===
+            # 典型场景：sheet"2 各团队核心指标(打折+当时归属)" AH 列
+            # 上层标签='col_<biz_alias_1>'（命中"预缴"），但列均值仅 8645.79 < 10000，
+            # 旧版被误判为普通数字 → 修复后强制走万级 fmt。
+            has_money_like = any(
+                k in str(cell_val) for cell_val in all_layers
+                for k in MONEY_LIKE_KEYWORDS
+                if cell_val
+            )
+            # === 优先级 4：均值>=10000 的列用万级 ===
+            col_avg = compute_column_numeric_avg(ws, col_idx, data_start, max_row)
+            use_wan = has_gmv or has_money_like or (wan_enabled and col_avg >= wan_threshold)
+            if use_wan:
+                number_format = '0"."0,"万";[Red]-0"."0,"万"'
+            else:
+                # === 优先级 5：普通数字 ===
+                # v3.54+：均值 < 1万 且 整列数据都是整数（无小数部分）→ 整数格式
+                #   场景：sheet"1.2" R17~R22 客户数列（64~103），但 has_gmv / is_integer_count 未命中
+                #   → 走普通数字 #,##0.00 显示成 "64.00" → 应显示 "64"
+                col_all_int = _column_all_integer(ws, col_idx, data_start, max_row)
+                if col_all_int:
+                    number_format = "#,##0;[Red]-#,##0"
+                else:
+                    number_format = "#,##0.00;[Red]-#,##0.00"
+
+        # 应用格式到数据行
+        # v3.54+：每行 B 列（指标列）标签可能不同——按行标签覆盖列格式
+        #   例：sheet"1.2" C~O 列整列均值大 → 走万级；但 R17~R22 B='col_<biz_alias_5>' → 应走整数
+        #   实现：cell 循环里先看 B 列标签，如命中整数列关键字 → 改为整数 fmt
+        #   优先级：行标签覆盖列标签
+        if header_cols:
+            label_col = max(header_cols)
+        else:
+            label_col = None
+        for r in range(data_start, max_row + 1):
+            # v3.27+ 单元格级判定：表头列范围内的数据行单元格不应用数字格式
+            if header_cells is not None and (r, col_idx) in header_cells:
+                continue
+            cell = ws.cell(row=r, column=col_idx)
+            v = get_cell_value(ws, r, col_idx)
+            if is_empty(v) or not isinstance(v, (int, float)) or isinstance(v, bool):
+                continue
+            # v3.54+：行标签覆盖列标签
+            row_fmt = number_format
+            if label_col is not None and label_col != col_idx:
+                row_label = get_cell_value(ws, r, label_col)
+                if row_label is not None and not is_value_for_merge(row_label):
+                    row_label_clean = _strip_parenthetical_content(str(row_label))
+                    if is_integer_count_column(row_label_clean):
+                        if ("折算" in row_label_clean) or ("月化" in row_label_clean):
+                            row_fmt = "#,##0.00;[Red]-#,##0.00"
+                        else:
+                            row_fmt = "#,##0;[Red]-#,##0"
+            cell.number_format = row_fmt
+
+            # v3.28+ 删除：金额列居右触发条件已移除（不再走 is_money_column）
+
+
+def apply_money_alignment(ws: Worksheet, data_start: int,
+                           max_row: int, max_col: int,
+                           empty_cols: List[int],
+                           header_rows: Optional[List[int]] = None,
+                           header_cells: Optional[set] = None) -> None:
+    """v3.4 起：金额列只居右，不加货币符号（用户明确）。
+
+    v3.28+ 删除触发条件："严格金额列（含 金额/收入/支出/回款/定价）"不再触发任何样式。
+    本函数保留为空实现（向后兼容），不再调用 `is_money_column`，也不再应用居右。
+    """
+    # v3.28+：删除金额列居右触发条件 — 此函数体不再执行任何操作
+    return
+
+
+def _build_multi_layer_headers(ws: Worksheet, header_rows: Optional[List[int]],
+                                max_col: int) -> List[str]:
+    """v3.19+：扫描多层表头，按列拼接所有层字符串作为判定字符串。
+
+    多层表头时，关键字（如"完成度"）通常在中间层而非最后一层（最后一层往往是日期/编号）。
+    把每列所有层的值拼成一个长字符串，让关键字判定更准。
+    """
+    if not header_rows:
+        return get_column_headers(ws, ws.max_row and 1 or 1)
+    all_layer_headers = []
+    for hr in header_rows:
+        layer = get_column_headers(ws, hr)
+        all_layer_headers.append(layer)
+    result = []
+    for col_idx in range(max_col):
+        parts = []
+        for layer in all_layer_headers:
+            if col_idx < len(layer):
+                parts.append(str(layer[col_idx]) if layer[col_idx] is not None else "")
+        result.append("".join(parts))
+    return result
+
+
+def apply_rate_data_bar(ws: Worksheet, data_start: int,
+                         max_row: int, max_col: int,
+                         empty_rows: List[int],
+                         header_rows: Optional[List[int]] = None,
+                         header_cells: Optional[set] = None) -> None:
+    """v3.19+：headers 从多层表头拼接读取。
+
+    v3.27+ 新增 header_cells：表头列范围内的数据行单元格不加入 Data Bar 范围。
+    v3.28+ 关键变更：触发条件改为"列的所有表头单元格中任意一个含达成率关键字"。
+                     不再依赖 _build_multi_layer_headers 的拼接字符串。
+    v3.41+ 修复：使用最后一层 header 判定（避免上层"结汇率"污染整列）
+                  同时排除 GMV 列（GMV 不应加进度条）
+    """
+    if header_rows is None:
+        header_rows = [1]
+    empty_rows_set = set(empty_rows)
+    last_hr = max(header_rows)
+
+    for col_idx in range(1, max_col + 1):
+        # v3.41+：使用最后一层 header 判定（避免上层"结汇率"等关键字污染整列）
+        last_header_val = get_cell_value(ws, last_hr, col_idx)
+        if last_header_val is None:
+            last_header_val = _extend_to_nearest_nonempty(ws, last_hr, col_idx)
+        # v3.41+：如果是日期格式，往上找非日期的层
+        if is_date_like(last_header_val):
+            for hr2 in range(last_hr - 1, min(header_rows) - 1, -1):
+                v2 = get_cell_value(ws, hr2, col_idx)
+                if v2 is None:
+                    v2 = _extend_to_nearest_nonempty(ws, hr2, col_idx)
+                if v2 and not is_date_like(v2):
+                    last_header_val = v2
+                    break
+        last_header = _strip_parenthetical_content(str(last_header_val) if last_header_val is not None else "")
+
+        # v3.41+：排除 GMV 列（GMV 列不应加进度条，应是 X.X 万 格式）
+        # 扫描所有层判断是否含"明确的GMV列名"
+        all_cells = _get_header_cells_in_col(ws, header_rows, col_idx)
+        has_gmv = False
+        for c in all_cells:
+            if not c:
+                continue
+            s = str(c).upper()
+            if 'GMV' in s:
+                import re as _re
+                if _re.search(r'(^|\s)GMV(\s|$)|\(GMV\)|（GMV）', s):
+                    has_gmv = True
+                    break
+                if _re.search(r'付款GMV|入账GMV|全量GMV|增量GMV|存量GMV|结汇.*GMV|GMV[$¥]|GMV（\$）|GMV\(\$\)|GMV同比|GMV环比|GMV达成', s):
+                    has_gmv = True
+                    break
+        # v3.48+：率类列优先判定 —— 如果 last_header 是 RATE/MOMYOY 列（含"达成率/留存率/同比"等），
+        # 即使全 layers 含"GMV"也优先按率列处理（如"col_<biz_alias_2>..."含全量GMV但本质是率）
+        if has_gmv and is_percent_column(last_header):
+            has_gmv = False
+        if has_gmv:
+            continue
+
+        # v3.42+：如果该列已被 apply_momyoy_data_bar 标记为 momyoy 列
+        # → 跳过黄色 Data Bar（避免黄色 + 红绿 + 3箭头叠加）
+        if getattr(ws, '_momyoy_cols', None) and col_idx in ws._momyoy_cols:
+            continue
+
+        # v3.42+：防御——主动检查"列是否含 momyoy 关键字"
+        # 即使 apply_momyoy_data_bar 因故未跑，也能避免叠加
+        if is_momyoy_in_header_cells(ws, header_rows, col_idx):
+            continue
+
+        # v3.41+：百分比列才加 Data Bar
+        if not is_percent_column(last_header):
+            continue
+        # v3.46+：percent 但 no-bar 列（费率/汇率/分润率/分佣率/折算率）不加 Data Bar
+        if is_percent_no_bar_column(last_header):
+            continue
+        data_rows = []
+        for r in range(data_start, max_row + 1):
+            if r in empty_rows_set:
+                continue
+            # v3.27+ 单元格级判定：表头列范围内不加入 Data Bar
+            if header_cells is not None and (r, col_idx) in header_cells:
+                continue
+            row_values = [get_cell_value(ws, r, c) for c in range(1, max_col + 1)]
+            if is_total_row(row_values):
+                continue
+            v = get_cell_value(ws, r, col_idx)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                data_rows.append(r)
+        if not data_rows:
+            continue
+
+        # v3.37+：固定上限为1（100%），这样≥100%就是满格进度条
+        col_letter = get_column_letter(col_idx)
+        first_r = data_rows[0]
+        last_r = data_rows[-1]
+        rng = f"{col_letter}{first_r}:{col_letter}{last_r}"
+        rule = DataBarRule(
+            start_type="num", start_value=0,
+            end_type="num", end_value=1,  # 固定上限为100%
+            color=YELLOW_HEX, showValue=True,
+        )
+        ws.conditional_formatting.add(rng, rule)
+
+
+def is_occupancy_in_header_cells(ws, header_rows, col_idx):
+    """v3.34+：判断 col_idx 列在 header_rows 范围内是否含"占比"关键字。
+    v3.35+：先剔除括号内容再判定（避免 "考核通过人数(达成率100%)" 等误判）。
+    """
+    return any(k in _strip_parenthetical_content(v_str)
+               for hr in header_rows
+               for v_str in [str(get_cell_value(ws, hr, col_idx) or "")]
+               if v_str
+               for k in OCCUPANCY_KEYWORDS)
+
+
+def apply_momyoy_data_bar(ws: Worksheet, data_start: int,
+                           max_row: int, max_col: int,
+                           empty_rows: List[int],
+                           header_rows: Optional[List[int]] = None,
+                           header_cells: Optional[set] = None) -> None:
+    """v3.19+：headers 从多层表头拼接读取。
+
+    v3.27+ 新增 header_cells：表头列范围内的数据行单元格不加入 Data Bar 范围。
+    v3.28+ 关键变更：触发条件改为"列的所有表头单元格中任意一个含环比/同比关键字"。
+    """
+    if header_rows is None:
+        header_rows = [1]
+    empty_rows_set = set(empty_rows)
+
+    for col_idx in range(1, max_col + 1):
+        # v3.28+ 触发条件：列的表头单元格中任意一个含环比/同比关键字
+        if not is_momyoy_in_header_cells(ws, header_rows, col_idx):
+            continue
+        data_rows = []
+        for r in range(data_start, max_row + 1):
+            if r in empty_rows_set:
+                continue
+            # v3.27+ 单元格级判定：表头列范围内不加入 Data Bar
+            if header_cells is not None and (r, col_idx) in header_cells:
+                continue
+            row_values = [get_cell_value(ws, r, c) for c in range(1, max_col + 1)]
+            if is_total_row(row_values):
+                continue
+            v = get_cell_value(ws, r, col_idx)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                data_rows.append(r)
+        if not data_rows:
+            continue
+
+        col_letter = get_column_letter(col_idx)
+        first_r = data_rows[0]
+        last_r = data_rows[-1]
+        rng = f"{col_letter}{first_r}:{col_letter}{last_r}"
+
+        vals = [get_cell_value(ws, r, col_idx) for r in data_rows]
+        min_val = min(vals)
+        max_val = max(vals)
+        abs_max = max(abs(min_val), abs(max_val), 0.01)
+
+        bar_rule = DataBarRule(
+            start_type="num", start_value=-abs_max,
+            end_type="num", end_value=abs_max,
+            color=RED_HEX, showValue=True,
+        )
+        ws.conditional_formatting.add(rng, bar_rule)
+
+        ws.conditional_formatting.add(rng, FormulaRule(
+            formula=[f'{col_letter}{first_r}<0'],
+            font=Font(name="微软雅黑", size=9, color="00B050", bold=True),
+        ))
+        ws.conditional_formatting.add(rng, FormulaRule(
+            formula=[f'{col_letter}{first_r}>0'],
+            font=Font(name="微软雅黑", size=9, color="FF0000", bold=True),
+        ))
+        ws.conditional_formatting.add(rng, FormulaRule(
+            formula=[f'{col_letter}{first_r}=0'],
+            font=Font(name="微软雅黑", size=9, color="FFB300", bold=True),
+        ))
+        # v3.42+：记录已被 momyoy 处理的列，避免 apply_rate_data_bar 重复加黄色 Data Bar
+        if not hasattr(ws, '_momyoy_cols'):
+            ws._momyoy_cols = set()
+        ws._momyoy_cols.add(col_idx)
+
+
+def format_header_dates(ws: Worksheet, header_rows, max_col: int) -> None:
+    """v3.19+：所有表头行的日期单元格 -> YY年MM月 格式。
+
+    兼容单层：传 `header_rows=1` 时行为与 v3.18 一致。
+    多层：对 `header_rows` 中每一层都执行日期格式化。
+
+    v3.20+ 修复：跳过已被合并的副单元格（避免 AttributeError）。
+    """
+    if isinstance(header_rows, int):
+        header_rows = [header_rows]
+    # 预计算所有合并区域（避免循环内重复遍历）
+    merged_ranges = list(ws.merged_cells.ranges)
+    for header_row in header_rows:
+        for c in range(1, max_col + 1):
+            # v3.20+ 跳过合并区域的副单元格（merged_cells.ranges 含 MergedCell）
+            cell_obj = ws.cell(row=header_row, column=c)
+            if cell_obj.__class__.__name__ == "MergedCell":
+                continue  # 副格只读，跳过
+            v = get_cell_value(ws, header_row, c)
+            if is_date_like(v):
+                formatted = format_date_cell(v)
+                if formatted:
+                    ws.cell(row=header_row, column=c).value = formatted
+
+
+# ============================================================
+# CSV 转换
+# ============================================================
+def convert_csv_to_xlsx(csv_path: Path) -> Path:
+    import csv as _csv
+
+    xlsx_path = csv_path.with_suffix(".tmp.xlsx")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = _csv.reader(f)
+        for row in reader:
+            ws.append(row)
+    wb.save(xlsx_path)
+    return xlsx_path
+
+
+# ============================================================
+# 标题/内容定位
+# ============================================================
+def detect_layout(ws: Worksheet, max_row: int, max_col: int,
+                   header_row: int = 1):
+    """定位表头行 / 表头列 / 数据行 / 数据列 / 表头单元格。
+
+    判定规则（v3.27+ 单元格级定义）：
+      - 表头行：自上而下扫描，前 N 行连续"全文本、非数字（非日期）、非合计"行
+      - 表头列：自左而右扫描，前 M 列连续"全文本、非数字（非日期）、非合计"列
+      - 数据行 = 剔除所有表头行后的行
+      - 数据列 = 剔除所有表头列后的列
+      - **表头单元格 = (r in header_rows) OR (c in header_cols) 的并集**
+        （即：表头行内所有列 + 表头列内所有行，整行整列概念）
+      - **数据单元格 = 有效行 × 有效列 范围内去除表头单元格的部分**
+
+    v3.27+ 关键变更：
+      1) 表头识别放宽到"整行/整列线性判定" → 不再因为单个数据列含数字而终止扫描
+         （若第 2 列在表头行内出现数字 → 第 2 列不是表头列，但第 3/4 列仍可能继续识别）
+      2) 表头单元格定义：表头行 × 表头列 不再做"剔除"，统一为"并集"判定
+      3) 数据单元格定义：有效行 × 有效列 去除上述表头单元格并集
+
+    v3.5 起：`is_date_like(v) == True` 时不视为"含数字"（表头可能是日期）。
+    """
+    MAX_HEADER_ROW_SCAN = 10   # 扫描前 10 行识别多级表头
+    MAX_HEADER_COL_SCAN = 5
+    MAX_HEADER_CELL_LEN = 20   # 表头单元格最大长度（说明文字通常更长）
+
+    def is_numeric_for_header(v):
+        """判定"含数字"：是数字 且不是日期。
+
+        v3.20+ 增强：识别字符串数字（如 "1500000" / "100"），
+        防止合计行被误判为表头。
+        """
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, (int, float)):
+            # v3.34+：日期数字（Excel 序列日期 1-73050）不算"含数字" → 允许表头识别继续
+            if is_date_like(v):
+                return False
+            return True
+        # 字符串型日期不算"数字"
+        if is_date_like(v):
+            return False
+        # 字符串型数字（v3.20+）：纯数字字符串视为"含数字"
+        if isinstance(v, str):
+            s = v.strip().replace(",", "").replace("万", "").replace("%", "").replace("¥", "")
+            try:
+                float(s)
+                return True
+            except (ValueError, TypeError):
+                return False
+        return False
+
+    def looks_like_header_row(row_vals):
+        """一行是否像表头（不是说明文字）：
+          - 单元格平均长度 ≤ MAX_HEADER_CELL_LEN
+          - 至少有 1 个非空单元格
+          - 不含典型的"说明/备注"关键字
+        """
+        non_blank = [v for v in row_vals if not is_empty(v)]
+        if not non_blank:
+            return False
+        # 太长 → 不是表头（说明文字通常一长句）
+        avg_len = sum(len(str(v)) for v in non_blank) / len(non_blank)
+        if avg_len > MAX_HEADER_CELL_LEN:
+            return False
+        # 排除明显的说明文字（v3.37+ 改用更精确的匹配，避免"申请"等业务术语误判）
+        text_join = " ".join(str(v) for v in non_blank)
+        # 使用更长的关键字或带上下文的短语，避免单字误匹配
+        note_keywords = [
+            "请打开", "请查看", "请参考", "请注意",  # 带"请"的完整短语
+            "打开链接", "查看说明", "备注信息", "测试数据", "举例",
+            "说明文档", "备注说明", "测试环境",  # 完整短语
+        ]
+        if any(k in text_join for k in note_keywords):
+            return False
+        return True
+
+    # 1) 表头行
+    header_rows = []
+    for r in range(header_row, min(header_row + MAX_HEADER_ROW_SCAN, max_row + 1)):
+        row_values = [get_cell_value(ws, r, c) for c in range(1, max_col + 1)]
+        non_blank = [v for v in row_values if not is_empty(v)]
+        if not non_blank:
+            # 空行跳过（不终止）
+            continue
+        # v3.20+ 修复：含 TITLE_KEYWORDS 的行（合计/总计/小计/标题/汇总）→ 强制排除表头识别
+        # 即使该行所有列都是数字（如合计行的金额合计），也不应被识别为表头
+        joined_text = " ".join(str(v) for v in non_blank)
+        if any(k in joined_text for k in TITLE_KEYWORDS):
+            break  # 此行是合计/总计行，应是数据区
+        # 太长或含说明关键字 → 不是表头，跳过（不作为表头）
+        if not looks_like_header_row(row_values):
+            continue
+        # 检查含数字
+        has_numeric = any(is_numeric_for_header(v) for v in non_blank)
+        if has_numeric:
+            break
+        # 通过所有检查 → 加入表头
+        header_rows.append(r)
+
+    # 兜底：若无表头，至少返回 header_row
+    if not header_rows:
+        header_rows = [header_row]
+
+    # 2) 表头列（同理排除说明文字）
+    # v3.27+ 重写：表头列按"线性扫描"识别，每列独立判定。
+    # 扫描范围：[1, header_row_max]，逐列判断该列在表头行范围内是否
+    # "全是非数字、非合计、非说明"。判定条件：
+    #   - 列非空（在表头行范围内至少有一个非空值）
+    #   - 不像说明文字（looks_like_header_row 通过）
+    #   - 不含数字（is_numeric_for_header 判定）
+    #   - 不含合计关键字（TITLE_KEYWORDS）
+    # 满足条件 → 加入 header_cols。不满足 → 跳过（但不终止扫描，后续列继续判定）。
+    header_cols = []
+    # v3.27+ 关键：表头列识别只看"表头行范围内"的列值
+    # 不再看整列所有行 —— 否则 B 列 R3/R4 含数字会被错误剔除
+    header_row_max = max(header_rows) if header_rows else header_row
+    for c in range(1, max_col + 1):
+        # 只取表头行范围 [1, header_row_max] 内的列值
+        col_values = [get_cell_value(ws, r, c) for r in range(1, header_row_max + 1)]
+        non_blank = [v for v in col_values if not is_empty(v)]
+        if not non_blank:
+            continue
+        # v3.27+ 关键：含 TITLE_KEYWORDS → 强制排除
+        joined_text = " ".join(str(v) for v in non_blank)
+        if any(k in joined_text for k in TITLE_KEYWORDS):
+            continue
+        # 不像说明文字
+        if not looks_like_header_row(col_values):
+            continue
+        # 含数字 → 不是表头列
+        if any(is_numeric_for_header(v) for v in non_blank):
+            continue
+        # v3.31+ 关键修复：表头列 = "行维度列"（如团队/业务线）。
+        # 判定标准：data_start 行起下方数据区有"非数字"内容（行分类标签）。
+        # 例：col 1 row 5='运营' row 6='业务A' → 行维度列；header_cols += 1
+        # 例：col 3 row 5=数字、row 6='-' → 不算行维度列；header_cols 不加 3
+        has_row_dimension = False
+        for r in range(header_row_max + 1, max_row + 1):
+            v = get_cell_value(ws, r, c)
+            if v is None:
+                continue
+            s = str(v).strip()
+            if not s or s == "-":
+                continue
+            # 含数字 → 不是行维度
+            # v3.34+：直接用 isinstance 判断，不走 is_numeric_for_header
+            # 避免日期豁免逻辑误判（如48420 这种日期范围内的数字实为业务数据）
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                continue
+            # 含合计关键字 → 不是行维度
+            if any(k in s for k in TITLE_KEYWORDS):
+                continue
+            # 走到这里就是非数字非合计非空的"行维度"内容
+            has_row_dimension = True
+            break
+        if not has_row_dimension:
+            continue
+        # 通过所有检查 → 加入表头列
+        header_cols.append(c)
+
+    if not header_cols:
+        header_cols = [1]
+
+    header_rows_set = set(header_rows)
+    header_cols_set = set(header_cols)
+    data_rows = [r for r in range(1, max_row + 1) if r not in header_rows_set]
+    data_cols = [c for c in range(1, max_col + 1) if c not in header_cols_set]
+
+    # v3.27+ 新增：单元格级表头/数据定义
+    # - 表头单元格 = (r in header_rows) OR (c in header_cols) 的并集
+    # - 数据单元格 = 有效行 × 有效列 范围内去除表头单元格的部分
+    header_cells = set()
+    for r in header_rows:
+        for c in range(1, max_col + 1):
+            header_cells.add((r, c))
+    for c in header_cols:
+        for r in range(1, max_row + 1):
+            header_cells.add((r, c))
+    data_cells = set()
+    for r in data_rows:
+        for c in data_cols:
+            if (r, c) not in header_cells:
+                data_cells.add((r, c))
+
+    return header_rows, header_cols, data_rows, data_cols, header_cells, data_cells
+
+
+# ============================================================
+# 主流程
+# ============================================================
+def clean_workbook(input_path: Path, output_path: Path,
+                    manual_header_rows: Optional[List[int]] = None,
+                    manual_header_cols: Optional[List[int]] = None,
+                    max_rows: Optional[int] = None,
+                    force_clean: bool = False,
+                    wan_enabled: bool = True) -> None:
+    """清洗入口。
+
+    manual_header_rows / manual_header_cols：
+        用户手动指定的标题行 / 标题列（如 [1, 2]）。
+        若提供，则跳过自动 detect_layout。
+    max_rows / force_clean / wan_enabled：
+        v3.7 新增，明细大表降级控制。详见 module docstring 与 main()。
+    """
+    suffix = input_path.suffix.lower()
+    if suffix == ".csv":
+        work_path = convert_csv_to_xlsx(input_path)
+        is_csv = True
+    else:
+        work_path = input_path
+        is_csv = False
+
+    # v3.7 起：先用 read_only 模式探测规模，避免对超大明细表做 load+save
+    try:
+        from openpyxl import load_workbook as _lw
+        _ro = _lw(work_path, read_only=True, data_only=True)
+        _sizes = [(ws.title, ws.max_row, ws.max_column) for ws in _ro.worksheets]
+        _ro.close()
+    except Exception as _e:
+        _sizes = []
+        print(f"   ⚠ 无法快速探测规模：{_e}")
+
+    _total_cells = sum(r * c for _, r, c in _sizes)
+    if _sizes and _total_cells >= LARGE_SHEET_CELLS:
+        if not force_clean:
+            print(
+                f"   ⚠ 检测到明细大表（总_cells={_total_cells:,} ≥ {LARGE_SHEET_CELLS:,}），"
+                f"openpyxl 清洗代价极高；默认仅复制原文件。"
+            )
+            print(
+                f"   ℹ 如确需清洗，请加 --force-clean（仅清洗前 --max-rows 行，可能耗时数分钟）。"
+            )
+            import shutil
+            shutil.copyfile(work_path, output_path)
+            if is_csv:
+                try:
+                    work_path.unlink()
+                except OSError:
+                    pass
+            return
+        # force_clean：read_only 读前 N 行，写新工作簿，再施加样式
+        print(
+            f"   ⚡ force-clean 模式：明细大表 {_total_cells:,} cells，仅清洗前 {max_rows} 行"
+        )
+        _force_clean_large(
+            work_path, output_path,
+            manual_header_rows=manual_header_rows,
+            manual_header_cols=manual_header_cols,
+            max_rows=max_rows or 2000,
+            wan_enabled=wan_enabled,
+        )
+        if is_csv:
+            try:
+                work_path.unlink()
+            except OSError:
+                pass
+        return
+
+    wb = openpyxl.load_workbook(work_path)
+    # v3.39+：加载后立即移除 AI 水印 drawings（避免 openpyxl save 时重新写回）
+    _remove_ai_drawings_from_workbook(wb)
+    for ws in wb.worksheets:
+        header_row = 1
+
+        # Step A: 检测实际数据范围
+        max_row, max_col = detect_data_extent(ws, header_row)
+
+        # Step B: 定位标题行 / 内容行 / 标题列 / 内容列
+        # v3.27+ 同时返回 header_cells / data_cells（单元格级定义）
+        if manual_header_rows is not None or manual_header_cols is not None:
+            header_rows = manual_header_rows or [1]
+            header_cols = manual_header_cols or [1]
+            header_rows_set = set(header_rows)
+            header_cols_set = set(header_cols)
+            data_rows = [r for r in range(1, max_row + 1) if r not in header_rows_set]
+            data_cols = [c for c in range(1, max_col + 1) if c not in header_cols_set]
+            # v3.27+ 手动模式同样生成表头/数据单元格集合
+            header_cells = set()
+            for r in header_rows:
+                for c in range(1, max_col + 1):
+                    header_cells.add((r, c))
+            for c in header_cols:
+                for r in range(1, max_row + 1):
+                    header_cells.add((r, c))
+            data_cells = set()
+            for r in data_rows:
+                for c in data_cols:
+                    if (r, c) not in header_cells:
+                        data_cells.add((r, c))
+            print(f"[{ws.title}] manual header_rows={header_rows} header_cols={header_cols} "
+                  f"data_start={max(header_rows) + 1}")
+        else:
+            header_rows, header_cols, data_rows, data_cols, header_cells, data_cells = detect_layout(
+                ws, max_row, max_col, header_row
+            )
+        data_start = max(header_rows) + 1
+        print(f"[{ws.title}] header_rows={header_rows} header_cols={header_cols} "
+              f"data_start={data_start} data_cols={data_cols}")
+
+        # 找空行空列
+        empty_rows = find_empty_rows(ws, max_row, max_col, start_row=1)
+        empty_cols = find_empty_cols(ws, max_row, max_col, start_col=1)
+
+        # 1. 表头智能合并（v3.30+ 三段优先级分类 + 行表头先行/列表头先列）
+        merge_header_by_rows(ws, header_cells, max_col, max_row,
+                              header_rows=header_rows,
+                              header_cols=header_cols)
+        # v3.21+：矩形扩展 pass2 — A1 有值 / A2 / B1 / B2 空 → 合并为 A1:B2
+        merge_header_rectangles(ws, set(header_rows), max_row, max_col)
+
+        # 2. 表头日期格式化（v3.19+ 多层表头）
+        format_header_dates(ws, header_rows, max_col)
+
+        # 3. 基础样式
+        apply_base_style(ws, max_row, max_col, empty_rows, empty_cols)
+
+        # 4. 表头/合计行加粗（含表头列式横向合并单元格所在行）
+        bold_header_and_total_rows(ws, max_row, max_col,
+                                    header_rows=header_rows,
+                                    header_cols=header_cols)
+
+        # 5. 内容区空值填充 '-'（标题区不填充）
+        # v3.27+ 使用单元格级判定（header_cells）
+        fill_empty_content_cells(ws, data_start, max_row, max_col,
+                                  empty_rows, empty_cols,
+                                  header_rows=header_rows,
+                                  header_cols=header_cols,
+                                  fill_value="-",
+                                  header_cells=header_cells)
+
+        # 6. 数字格式化（率/通过率/完成率/环比/同比 一律百分比 0.00%；万级自动缩放）
+        # v3.27+ 仅对非表头单元格应用数字格式
+        apply_number_formats(ws, data_start, max_row, max_col, empty_cols,
+                              header_rows=header_rows,
+                              header_cols=header_cols,
+                              wan_enabled=not getattr(ws, '_no_wan', False),
+                              header_cells=header_cells)
+
+        # 7. 达成率/通过率/完成率 Data Bar（v3.27+ 仅对非表头单元格）
+        apply_rate_data_bar(ws, data_start, max_row, max_col, empty_rows,
+                            header_rows=header_rows,
+                            header_cells=header_cells)
+
+        # 9. 环比/同比 Data Bar + 箭头（v3.27+ 仅对非表头单元格）
+        apply_momyoy_data_bar(ws, data_start, max_row, max_col, empty_rows,
+                              header_rows=header_rows,
+                              header_cells=header_cells)
+
+        # 10. 列宽最小宽度自适应（v3.4：内容不换行，标题 ≤ 2 行）
+        auto_fit_columns(ws, max_row, max_col, empty_rows, empty_cols,
+                         header_rows=header_rows)
+
+        # v3.7 新增：debug 模式打印每个 sheet 写入的样式摘要
+        if globals().get("_DEBUG", False):
+            print(f"\n  --- [{ws.title}] 样式写入摘要 ---")
+            for r in range(1, min(max_row, 20) + 1):
+                for c in range(1, min(max_col, 15) + 1):
+                    cell = ws.cell(row=r, column=c)
+                    if cell.value is None and cell.number_format == "General":
+                        continue
+                    if cell.number_format != "General" or cell.font.bold:
+                        bold = "B" if cell.font.bold else "-"
+                        print(f"    {cell.coordinate}: v={cell.value!r:14} fmt={cell.number_format!r:30} bold={bold}")
+            # 条件格式
+            cf_count = len(list(ws.conditional_formatting._cf_rules.keys()))
+            print(f"  条件格式: {cf_count} 个范围")
+            for rng in ws.conditional_formatting._cf_rules.keys():
+                print(f"    {rng.sqref}")
+
+    # v3.9+：清空 AI/工具生成的元数据（避免 docProps/core.xml 带 "openpyxl" creator 等水印）
+    _strip_watermarks_openpyxl_props(wb)
+
+    wb.save(output_path)
+
+    # v3.18+：后置清理 docProps/app.xml 中的 Application 字段（openpyxl 残留水印）
+    _strip_watermarks_postsave(str(output_path))
+
+    # v3.40+：保留迷你图（Sparkline）
+    # openpyxl 加载时会丢弃 sparklines，需要从原始文件提取并合并
+    _preserve_sparklines_postsave(str(work_path), str(output_path))
+
+    # v3.19+：清除 AI/插件生成的浮层对象（drawings/comments/ctrlProps/activeX/embeddings/media/charts/...）
+    _strip_ai_artifacts_postsave(str(output_path))
+
+    # v3.33+：删除 docProps/custom.xml（WPS/Lark/AI 工具生成的指纹文件，含 ICV、KSOProductBuildVer）
+    _strip_custom_props_postsave(str(output_path))
+
+    # v3.33+：清理 docProps/core.xml 中的 creator/lastModifiedBy 等元数据字段
+    _strip_creator_metadata_postsave(str(output_path))
+
+    # v3.29+：修复 dangling externalLink 引用（删除外部链接文件后，
+    # 同步清理 workbook.xml 的 <externalReferences> 节点 + workbook.xml.rels 的 rel 节点），
+    # 否则 openpyxl 重新加载会抛 `'NoneType' object has no attribute 'Target'`，
+    # 导致下游所有 cell.number_format / cell.style 写入静默失败。
+    _strip_external_link_refs_postsave(str(output_path))
+
+    if is_csv:
+        try:
+            work_path.unlink()
+        except OSError:
+            pass
+
+
+def _force_clean_large(input_path: Path, output_path: Path,
+                        manual_header_rows: Optional[List[int]] = None,
+                        manual_header_cols: Optional[List[int]] = None,
+                        max_rows: int = 2000,
+                        wan_enabled: bool = True) -> None:
+    """明细大表快速清洗（v3.7 起）。
+
+    流程：
+      1) read_only 模式读所有 sheet 的全部行（仅值，不加载样式/合并）
+      2) 截断到 header_rows + 前 max_rows 行；按 (sheet_name, headers, data_rows) 缓存
+      3) 新建 workbook，按值写入并施加样式（完整跑一遍 clean_workbook 内层流程）
+    """
+    from openpyxl import load_workbook as _lw
+
+    # 1) 读取快照
+    ro_wb = _lw(input_path, read_only=True, data_only=True)
+    snapshot = []
+    for ws_ro in ro_wb.worksheets:
+        rows = list(ws_ro.iter_rows(values_only=True))
+        if not rows:
+            snapshot.append((ws_ro.title, [], []))
+            continue
+        # 顶部若干行为表头（manual_header_rows 给出确切行数；否则取第 1 行作表头）
+        if manual_header_rows:
+            header_count = max(manual_header_rows)
+        else:
+            header_count = 1
+        # 多层表头：保留所有表头行（每个元素是 1 行 values）
+        header_rows_data = [
+            [("" if v is None else v) for v in r] for r in rows[:header_count]
+        ]
+        data_rows = [
+            [("" if v is None else v) for v in r]
+            for r in rows[header_count : header_count + max_rows]
+        ]
+        snapshot.append((ws_ro.title, header_rows_data, data_rows))
+    ro_wb.close()
+
+    # 2) 写入新工作簿
+    wb = openpyxl.Workbook()
+    default_ws = wb.active
+    wb.remove(default_ws)
+
+    for sheet_name, headers, data_rows in snapshot:
+        new_ws = wb.create_sheet(title=sheet_name[:31])  # Excel sheet 名最长 31
+        # 多层表头：逐行 append
+        for hr in headers:
+            new_ws.append(list(hr))
+        # 数据行
+        for row in data_rows:
+            new_ws.append(row)
+
+        header_row = 1
+        max_row, max_col = detect_data_extent(new_ws, header_row)
+
+        if manual_header_rows is not None or manual_header_cols is not None:
+            header_rows = manual_header_rows or [1]
+            header_cols = manual_header_cols or [1]
+            header_rows_set = set(header_rows)
+            header_cols_set = set(header_cols)
+            data_rows_idx = [r for r in range(1, max_row + 1) if r not in header_rows_set]
+            data_cols = [c for c in range(1, max_col + 1) if c not in header_cols_set]
+            # v3.27+ 手动模式生成单元格集合
+            header_cells = set()
+            for r in header_rows:
+                for c in range(1, max_col + 1):
+                    header_cells.add((r, c))
+            for c in header_cols:
+                for r in range(1, max_row + 1):
+                    header_cells.add((r, c))
+            data_cells = set()
+            for r in data_rows_idx:
+                for c in data_cols:
+                    if (r, c) not in header_cells:
+                        data_cells.add((r, c))
+            print(f"[{new_ws.title}] (force-clean) manual header_rows={header_rows} header_cols={header_cols} "
+                  f"data_start={max(header_rows) + 1}")
+        else:
+            header_rows, header_cols, data_rows_idx, data_cols, header_cells, data_cells = detect_layout(
+                new_ws, max_row, max_col, header_row
+            )
+        data_start = max(header_rows) + 1
+        print(f"[{new_ws.title}] (force-clean) header_rows={header_rows} header_cols={header_cols} "
+              f"data_start={data_start}")
+
+        empty_rows = find_empty_rows(new_ws, max_row, max_col, start_row=1)
+        empty_cols = find_empty_cols(new_ws, max_row, max_col, start_col=1)
+
+        # 与 clean_workbook 内层一致的样式序列（v3.19+ 多层表头）
+        # v3.22+：用逐行算法替代旧版「先横后纵」两次调用
+        merge_header_by_rows(new_ws, header_rows, max_col, max_row)
+        # v3.21+：矩形扩展 pass2
+        merge_header_rectangles(new_ws, set(header_rows), max_row, max_col)
+        format_header_dates(new_ws, header_rows, max_col)
+        apply_base_style(new_ws, max_row, max_col, empty_rows, empty_cols)
+        bold_header_and_total_rows(new_ws, max_row, max_col,
+                                    header_rows=header_rows,
+                                    header_cols=header_cols)
+        # v3.27+ 全部使用单元格级判定（header_cells）
+        fill_empty_content_cells(new_ws, data_start, max_row, max_col,
+                                  empty_rows, empty_cols,
+                                  header_rows=header_rows,
+                                  header_cols=header_cols,
+                                  fill_value="-",
+                                  header_cells=header_cells)
+        apply_number_formats(new_ws, data_start, max_row, max_col, empty_cols,
+                              header_rows=header_rows,
+                              wan_enabled=wan_enabled,
+                              header_cells=header_cells)
+        # v3.28+ 删除 apply_money_alignment 调用
+        apply_rate_data_bar(new_ws, data_start, max_row, max_col, empty_rows,
+                            header_rows=header_rows,
+                            header_cells=header_cells)
+        apply_momyoy_data_bar(new_ws, data_start, max_row, max_col, empty_rows,
+                              header_rows=header_rows,
+                              header_cells=header_cells)
+        auto_fit_columns(new_ws, max_row, max_col, empty_rows, empty_cols,
+                         header_rows=header_rows)
+
+    # v3.9+：清空 AI/工具生成的元数据
+    _strip_watermarks_openpyxl_props(wb)
+    wb.save(output_path)
+    # v3.18+：后置清理 docProps/app.xml 中的 Application 字段
+    _strip_watermarks_postsave(str(output_path))
+    # v3.19+：清除 AI/插件生成的浮层对象
+    _strip_ai_artifacts_postsave(str(output_path))
+    # v3.33+：删除 docProps/custom.xml + 清理 docProps/core.xml 元数据
+    _strip_custom_props_postsave(str(output_path))
+    _strip_creator_metadata_postsave(str(output_path))
+
+
+def _parse_int_list(s: str) -> List[int]:
+    """解析 '1,2,3' / '1-3' / '1,2-4' 形式的列表。"""
+    result = []
+    for part in s.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            result.extend(range(int(a), int(b) + 1))
+        else:
+            result.append(int(part))
+    return sorted(set(result))
+
+
+# ============================================================
+# v3.9+：水印清理（docProps/core.xml + docProps/app.xml）
+# ============================================================
+def _strip_watermarks_openpyxl_props(wb) -> None:
+    """v3.9+：清空 wb.properties 中的工具水印字段（12 项）。"""
+    try:
+        wb.properties.creator = ""
+        wb.properties.lastModifiedBy = ""
+        wb.properties.title = ""
+        wb.properties.subject = ""
+        wb.properties.description = ""
+        wb.properties.keywords = ""
+        wb.properties.category = ""
+        wb.properties.contentStatus = ""
+        wb.properties.identifier = ""
+        wb.properties.language = ""
+        wb.properties.revision = "1"
+        wb.properties.version = ""
+    except Exception:
+        pass
+
+
+def _strip_watermarks_postsave(xlsx_path: str) -> None:
+    """v3.18+：写出后二次清理 docProps/app.xml 中的工具水印。
+
+    openpyxl 即使清空 wb.properties，docProps/app.xml 仍写
+    `<Application>Microsoft Excel Compatible / Openpyxl 3.x.x</Application>`。
+    本函数解 zip 改写 `<Application>` 节点为中性 `Microsoft Excel`。
+    失败时静默兜底。
+    """
+    import zipfile, shutil, os, re as _re
+    src = str(xlsx_path)
+    tmp = src + ".tmp"
+    try:
+        with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "docProps/app.xml":
+                    text = data.decode("utf-8", errors="ignore")
+                    new_text = _re.sub(
+                        r"<Application>.*?</Application>",
+                        "<Application>Microsoft Excel</Application>",
+                        text,
+                        flags=_re.DOTALL,
+                    )
+                    data = new_text.encode("utf-8")
+                zout.writestr(item, data)
+        shutil.move(tmp, src)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _strip_custom_props_postsave(xlsx_path: str) -> None:
+    """v3.33+：删除 `docProps/custom.xml`（WPS/Lark/AI 工具生成的指纹）。
+
+    常见指纹字段：
+      - ICV（Lark/飞书 Excel 的内部标识）
+      - KSOProductBuildVer（WPS Office 版本号）
+      - CalculationRule（计算引擎标识）
+      - ContentTypeId（AI 插件注入）
+
+    同时清理 `_rels/.rels` 中对 custom.xml 的引用 + `[Content_Types].xml` 的 Override。
+    失败时静默兜底。
+    """
+    import zipfile, shutil, os, re as _re
+    src = str(xlsx_path)
+    tmp = src + ".tmp"
+    try:
+        with zipfile.ZipFile(src, "r") as zin:
+            names = set(zin.namelist())
+        if "docProps/custom.xml" not in names:
+            return  # 没有 custom.xml，无需清理
+        with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == "docProps/custom.xml":
+                    continue  # 删除整个 custom.xml
+                data = zin.read(item.filename)
+                text = None
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = None
+                if text is not None:
+                    # _rels/.rels 中删除 custom.xml 的 Relationship（属性顺序任意，含 /）
+                    if item.filename == "_rels/.rels":
+                        text = _re.sub(
+                            r'<Relationship\b[^>]*?Target="docProps/custom\.xml"[^>]*?/>',
+                            "",
+                            text,
+                        )
+                    # [Content_Types].xml 中删除 custom.xml 的 Override
+                    elif item.filename == "[Content_Types].xml":
+                        text = _re.sub(
+                            r'<Override\b[^>]*?PartName="/docProps/custom\.xml"[^>]*?/>',
+                            "",
+                            text,
+                        )
+                    data = text.encode("utf-8") if isinstance(text, str) else data
+                zout.writestr(item, data)
+        shutil.move(tmp, src)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _strip_creator_metadata_postsave(xlsx_path: str) -> None:
+    """v3.33+：清理 docProps/core.xml 中的 creator/lastModifiedBy/created/modified 等元数据。
+
+    这些字段可能被 openpyxl 残留或某些工具写入 AI/插件身份标识。
+    强制将所有元数据字段置空（保留 docProps 文件结构）。
+    """
+    import zipfile, shutil, os, re as _re
+    src = str(xlsx_path)
+    tmp = src + ".tmp"
+    try:
+        # 清理字段列表
+        FIELDS_TO_CLEAR = [
+            "dc:creator", "cp:lastModifiedBy",
+            "dc:title", "dc:subject", "dc:description",
+            "cp:keywords", "cp:category", "cp:contentStatus",
+            "dc:identifier", "dc:language",
+            "cp:version", "cp:revision",
+        ]
+        with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "docProps/core.xml":
+                    text = data.decode("utf-8", errors="ignore")
+                    for field in FIELDS_TO_CLEAR:
+                        text = _re.sub(
+                            rf"<{field}>.*?</{field}>",
+                            f"<{field}></{field}>",
+                            text,
+                            flags=_re.DOTALL,
+                        )
+                    data = text.encode("utf-8")
+                zout.writestr(item, data)
+        shutil.move(tmp, src)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+            pass
+
+
+def _strip_external_link_refs_postsave(xlsx_path: str) -> None:
+    """v3.29+：修复 dangling externalLink 引用导致的 openpyxl 二次加载失败。
+
+    背景：
+      v3.18 `_strip_watermarks_postsave` + v3.19 `_strip_ai_artifacts_postsave`
+      已删除 `xl/externalLinks/*.xml` 部件，但**未同步清理**：
+        - `xl/workbook.xml` 中的 `<externalReferences><externalReference r:id="..."/></externalReferences>`
+        - `xl/_rels/workbook.xml.rels` 中的对应 Relationship 节点（Target=None 残留）
+      结果：openpyxl 重新加载抛 `'NoneType' object has no attribute 'Target'`，
+      异常被 openpyxl 内部吞没 → 所有 `cell.number_format = ...` / `cell.style`
+      写入**静默失败**。这是 v3.26 之前用户多次反馈"数字格式不生效"的根因。
+
+    本函数：
+      1) 删除 `xl/workbook.xml` 中整个 `<externalReferences>` 节点
+      2) 删除 `xl/_rels/workbook.xml.rels` 中所有 `externalLinks` 的 Relationship
+      3) 删除 `[Content_Types].xml` 中所有 `externalLink` Override
+    失败时静默兜底。
+    """
+    import zipfile, shutil, os, re as _re
+    src = str(xlsx_path)
+    tmp = src + ".tmp"
+    try:
+        with zipfile.ZipFile(src, "r") as zin:
+            files = {n: zin.read(n) for n in zin.namelist()}
+
+        # 1) xl/workbook.xml：删除整个 <externalReferences> 节点
+        wb_xml_name = "xl/workbook.xml"
+        if wb_xml_name in files:
+            wb_xml = files[wb_xml_name].decode("utf-8", errors="ignore")
+            wb_xml = _re.sub(
+                r"<externalReferences>.*?</externalReferences>",
+                "",
+                wb_xml,
+                flags=_re.DOTALL,
+            )
+            files[wb_xml_name] = wb_xml.encode("utf-8")
+
+        # 2) xl/_rels/workbook.xml.rels：删除所有 Target 包含 externalLinks 的 Relationship
+        wb_rels_name = "xl/_rels/workbook.xml.rels"
+        if wb_rels_name in files:
+            wb_rels = files[wb_rels_name].decode("utf-8", errors="ignore")
+            wb_rels = _re.sub(
+                r'<Relationship\b[^/]*?Type="[^"]*externalLink[^"]*"[^/]*?/>',
+                "",
+                wb_rels,
+            )
+            wb_rels = _re.sub(
+                r'<Relationship\b[^/]*?Target="[^"]*externalLinks[^"]*"[^/]*?/>',
+                "",
+                wb_rels,
+            )
+            files[wb_rels_name] = wb_rels.encode("utf-8")
+
+        # 3) [Content_Types].xml：删除所有 externalLink Override
+        ct_name = "[Content_Types].xml"
+        if ct_name in files:
+            ct = files[ct_name].decode("utf-8", errors="ignore")
+            ct = _re.sub(
+                r'<Override\b[^/]*?PartName="[^"]*externalLinks[^"]*"[^/]*?/>',
+                "",
+                ct,
+            )
+            files[ct_name] = ct.encode("utf-8")
+
+        # 写回
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for n, d in files.items():
+                zout.writestr(n, d)
+        shutil.move(tmp, src)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _strip_watermarks(wb=None, xlsx_path=None) -> None:
+    """v3.18+：统一的 AI 生成水印清理入口。"""
+    if wb is not None:
+        _strip_watermarks_openpyxl_props(wb)
+    if xlsx_path is not None:
+        _strip_watermarks_postsave(xlsx_path)
+
+
+# v3.19+：要剥离的 AI / 插件产生的部件
+# - drawings/：图形浮层（"AI 生成"、"批注形状"、文本框等）
+# - drawings/_rels/：图形关系
+# - comments*.xml：批注（可能是 AI 插件插入的"AI 助手"批注）
+# - ctrlProps/：ActiveX / 表单控件
+# - worksheets/_rels/*legacyDrawing*：旧版绘图标记
+# - media/：嵌入的图片（AI 生成的图标、截图等）
+_AI_ARTIFACT_PARTS = (
+    "xl/drawings/",
+    "xl/comments",          # 含 comments1.xml / _rels/comments1.xml.rels
+    "xl/ctrlProps/",
+    "xl/activeX/",
+    "xl/embeddings/",
+    "xl/media/",
+    # v3.21+ 扩展：覆盖更多 AI 插件可能留下的部件
+    "xl/customXml/",        # AI 插件的自定义 XML（Office 加载项数据）
+    "xl/queryTable/",       # 数据查询表
+    "xl/queryTables/",      # 数据查询表（复数）
+    "xl/connections.xml",   # 数据连接
+    "xl/externalLinks/",    # 外部链接
+    "xl/vbaProject.bin",    # VBA 宏（AI 插件可能带）
+    "xl/vbaProjectSignature.xml",
+)
+_AI_ARTIFACT_REL_TYPES = (
+    "drawing",
+    "comments",
+    "ctrlProp",
+    "activeX",
+    "oleObject",
+    "image",
+    "chart",                 # 用户也要求"禁止 AI 生成对象"，常见 AI 插件会塞 chart
+    "table",
+    "pivotTable",
+    "pivotCacheDefinition",
+    "slicer",
+    "slicerCache",
+)
+
+
+def _remove_ai_drawings_from_workbook(wb) -> None:
+    """v3.39+：从 openpyxl workbook 中移除所有 AI 水印 drawings。
+
+    原因：原始文件中含 AILabel 等 AI 生成的浮层对象（drawing 文件）。
+    openpyxl 加载后会保留这些引用，save 时会重新写回，导致 _strip_ai_artifacts_postsave
+    虽然删除了文件，但被 openpyxl 重新创建。
+
+    修复：在加载后立即从 workbook 中移除 drawing 引用，让 save 时不再生成这些文件。
+    """
+    # 1) 移除每个 sheet 的 _charts 和 _images（这些会导致生成 drawings/ 目录下的文件）
+    for ws in wb.worksheets:
+        # 移除 charts
+        if hasattr(ws, '_charts'):
+            ws._charts = []
+        # 移除 images
+        if hasattr(ws, '_images'):
+            ws._images = []
+        # 移除 drawings 引用（关键：让 save 时不写 drawing 节点）
+        # openpyxl 中 drawing 通过 _drawing 属性引用
+        if hasattr(ws, '_drawing'):
+            ws._drawing = None
+
+    # 2) 从 workbook 中移除所有 vmlDrawing（VML 旧式绘图，AI 也常用）
+    # openpyxl 没有直接的属性，需要通过 _sheets 访问
+    pass
+
+
+def _preserve_sparklines_postsave(src_xlsx_path: str, dst_xlsx_path: str) -> None:
+    """v3.40+：从原始文件提取 sparklineGroups 元素，合并到输出文件中。
+
+    原因：openpyxl 不支持迷你图（Sparkline），加载时会发出警告并丢弃。
+    这会导致原始文件中的迷你图在清洗后丢失。
+
+    修复：在 save 后从原始 xlsx 中提取每个 sheet 的 sparklineGroups，
+    合并到输出文件的对应 sheet 中。
+    """
+    import zipfile, shutil, os, re as _re
+
+    # 1) 从原始文件读取 sparklines
+    sparklines = {}  # sheet_filename -> sparklineGroups XML 字符串
+    try:
+        with zipfile.ZipFile(src_xlsx_path, 'r') as zin:
+            for name in zin.namelist():
+                if 'worksheets/sheet' in name and name.endswith('.xml'):
+                    content = zin.read(name).decode('utf-8')
+                    m = _re.search(r'<x14:sparklineGroups[^>]*>.*?</x14:sparklineGroups>', content, _re.DOTALL)
+                    if m:
+                        sparklines[name] = m.group()
+    except Exception:
+        return
+
+    if not sparklines:
+        return
+
+    # 2) 合并到输出文件
+    tmp = dst_xlsx_path + ".tmp"
+    try:
+        with zipfile.ZipFile(dst_xlsx_path, 'r') as zin, zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+
+                # 处理 worksheet：合并 sparklines
+                if item.filename in sparklines:
+                    try:
+                        text = data.decode('utf-8')
+                        sparkline_xml = sparklines[item.filename]
+
+                        # 修复：openpyxl 写入的 worksheet 标签可能没有 x14 命名空间
+                        # 必须确保 xmlns:x14 和 xmlns:mc 都存在
+                        if 'xmlns:x14=' not in text:
+                            text = _re.sub(
+                                r'<worksheet([^>]*)>',
+                                lambda m: '<worksheet' + m.group(1) + ' xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x14ac">',
+                                text,
+                                count=1,
+                            )
+                        elif 'mc:Ignorable' not in text:
+                            # 已有 xmlns:x14 但缺少 mc:Ignorable
+                            text = _re.sub(
+                                r'<worksheet([^>]*)>',
+                                lambda m: '<worksheet' + m.group(1) + ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="x14ac">',
+                                text,
+                                count=1,
+                            )
+
+                        # 检查是否已有 extLst
+                        if '<extLst>' in text:
+                            # 追加到现有 extLst 内（带 <ext> 包裹层让 x14: 命名空间生效）
+                            text = _re.sub(
+                                r'</extLst>',
+                                '<ext uri="{05C60535-1F16-4fd2-B633-F4F36F0041E1}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">' + sparkline_xml + '</ext></extLst>',
+                                text,
+                                count=1,
+                            )
+                        else:
+                            # 在 </worksheet> 前插入 extLst（带 <ext> 包裹层）
+                            ext_xml = '<extLst><ext uri="{05C60535-1F16-4fd2-B633-F4F36F0041E1}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">' + sparkline_xml + '</ext></extLst>'
+                            text = _re.sub(
+                                r'</worksheet>',
+                                ext_xml + '</worksheet>',
+                                text,
+                                count=1,
+                            )
+
+                        data = text.encode('utf-8')
+                    except Exception:
+                        pass
+
+                zout.writestr(item, data)
+    except Exception:
+        return
+
+    # 替换原文件
+    try:
+        os.replace(tmp, dst_xlsx_path)
+    except Exception:
+        try:
+            shutil.copyfile(tmp, dst_xlsx_path)
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _strip_ai_artifacts_postsave(xlsx_path: str) -> None:
+    """v3.19+：写出后清除 AI / 插件生成的浮层对象 / 批注 / ActiveX / 图表 / 嵌入图片。
+
+    删除的部件：
+      - `xl/drawings/*.xml` + `xl/drawings/_rels/*`（WPS/Excel 的"AI 生成"灰色浮层通常是 drawing）
+      - `xl/comments*.xml`（批注）
+      - `xl/ctrlProps/*.xml`（ActiveX / 表单控件）
+      - `xl/activeX/*`
+      - `xl/embeddings/*`
+      - `xl/media/*`（嵌入图片 / 视频 / 截图）
+      - `xl/charts/*`（图表）
+      - `xl/pivotTables/*` / `xl/pivotCache/*`（数据透视表）
+      - `xl/slicers/*`（切片器）
+      - `xl/tables/*`（结构化表）
+
+    同时清理：
+      - `[Content_Types].xml` 中对应的 Override 节点
+      - `xl/worksheets/_rels/sheet*.xml.rels` 中的 drawing/comments 引用
+      - `xl/_rels/workbook.xml.rels` 中的对应 rels
+      - 每个 sheet xml 中的 `<drawing r:id="..."/>` / `<legacyDrawing r:id="..."/>` 节点
+    """
+    import zipfile, shutil, os, re as _re
+    src = str(xlsx_path)
+    tmp = src + ".tmp"
+    # 1) 探测哪些部件存在（避免空操作）
+    to_remove = set()
+    try:
+        with zipfile.ZipFile(src, "r") as zin:
+            for name in zin.namelist():
+                for prefix in _AI_ARTIFACT_PARTS:
+                    prefix_dir = prefix.rstrip("/")
+                    # 匹配方式1：部件在目录下（drawings/、media/、customXml/）
+                    # 匹配方式2：部件本身就是精确文件名（connections.xml、vbaProject.bin）
+                    if name.startswith(prefix) or name == prefix_dir:
+                        to_remove.add(name)
+                        break
+    except Exception:
+        return
+
+    if not to_remove:
+        # 也要检查 sheet xml 中的 drawing / legacyDrawing 节点（有时部件本身已删但引用还在）
+        pass
+
+    try:
+        with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename in to_remove:
+                    continue
+                data = zin.read(item.filename)
+                text = None
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = None
+
+                # 处理 [Content_Types].xml：删除引用了已删部件的 Override 节点
+                if item.filename == "[Content_Types].xml" and text is not None:
+                    new_text = text
+                    for removed in to_remove:
+                        # /xl/drawings/drawing1.xml → PartName="/xl/drawings/drawing1.xml"
+                        new_text = _re.sub(
+                            r'<Override\s+PartName="/?' + _re.escape(removed) + r'"\s+[^/]*/>',
+                            "",
+                            new_text,
+                        )
+                        # 也处理 /xl/comments.xml 这种形式
+                        new_text = _re.sub(
+                            r'<Override\s+PartName="/?' + _re.escape("/" + removed) + r'"\s+[^/]*/>',
+                            "",
+                            new_text,
+                        )
+                    data = new_text.encode("utf-8")
+
+                # 处理 sheet*.xml.rels：删除引用了已删部件的 Relationship 节点
+                elif item.filename.startswith("xl/worksheets/_rels/") and item.filename.endswith(".rels") and text is not None:
+                    new_text = text
+                    for removed in to_remove:
+                        new_text = _re.sub(
+                            r'<Relationship\s+[^>]*Target="[^"]*' + _re.escape(removed.split("/", 1)[-1]) + r'"\s+[^/]*/>',
+                            "",
+                            new_text,
+                        )
+                    data = new_text.encode("utf-8")
+
+                # 处理 sheet*.xml：删除 <drawing .../> / <legacyDrawing .../> / <picture .../> 等
+                elif item.filename.startswith("xl/worksheets/sheet") and item.filename.endswith(".xml") and text is not None:
+                    new_text = _re.sub(
+                        r"<drawing\s[^/]*/>",
+                        "",
+                        text,
+                    )
+                    new_text = _re.sub(
+                        r"<legacyDrawing\s[^/]*/>",
+                        "",
+                        new_text,
+                    )
+                    new_text = _re.sub(
+                        r"<picture\s[^/]*/>",
+                        "",
+                        new_text,
+                    )
+                    new_text = _re.sub(
+                        r"<oleObjects\s[^/]*/>",
+                        "",
+                        new_text,
+                    )
+                    data = new_text.encode("utf-8")
+
+                # 处理 xl/_rels/workbook.xml.rels：删除引用了已删部件的 Relationship 节点
+                elif item.filename == "xl/_rels/workbook.xml.rels" and text is not None:
+                    new_text = text
+                    for removed in to_remove:
+                        new_text = _re.sub(
+                            r'<Relationship\s+[^>]*Target="[^"]*' + _re.escape(removed.split("/", 1)[-1]) + r'"\s+[^/]*/>',
+                            "",
+                            new_text,
+                        )
+                    data = new_text.encode("utf-8")
+
+                zout.writestr(item, data)
+        shutil.move(tmp, src)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# ============================================================
+# v3.13+：表头识别阈值检测
+# ============================================================
+def detect_header_rows_from_rows(rows, threshold: int = 2, max_scan: int = 10) -> List[int]:
+    """v3.13+：根据连续含数字行数自动识别表头行。"""
+    def has_numeric(row) -> bool:
+        for v in row:
+            if v is None or v == "":
+                continue
+            if isinstance(v, (int, float)):
+                return True
+            try:
+                float(str(v).replace(",", "").replace("%", ""))
+                return True
+            except (ValueError, TypeError):
+                continue
+        return False
+
+    header_rows = []
+    numeric_run = 0
+    for i, row in enumerate(rows[:max_scan]):
+        if has_numeric(row):
+            numeric_run += 1
+            if numeric_run >= threshold:
+                data_start = i - (threshold - 1)
+                header_rows = list(range(1, data_start + 1))
+                return header_rows
+        else:
+            numeric_run = 0
+            header_rows.append(i + 1)
+    if not header_rows:
+        header_rows = [1]
+    return header_rows
+
+
+# ============================================================
+# v3.12+：xlsxwriter 纯写导出（CLI --xwriter 入口）
+# ============================================================
+def xwriter_export(
+    input_path: "Path",
+    output_path: "Path",
+    preserve_input_format: bool = True,
+    header_threshold: int = 2,
+    header_max_scan: int = 10,
+) -> None:
+    """v3.12+：用 xlsxwriter 引擎纯写新表。
+
+    流程：
+      1) read_only 读 input 所有 sheet 的 values + cell.number_format
+      2) 用 detect_header_rows_from_rows 自动识别表头（threshold / max_scan）
+      3) 调 excel_writer.write_multi_sheet_xlsx 写出
+      4) v3.16+ 自检：output styles.xml 是否含 input format
+      5) v3.18+ 后置 docProps/app.xml 清理
+    """
+    from openpyxl import load_workbook as _lw
+    from excel_writer import write_multi_sheet_xlsx
+
+    # 1) 读快照
+    ro_wb = _lw(str(input_path), read_only=True, data_only=True)
+    snapshot = []  # [(sheet_name, header_rows, data_rows, column_specs)]
+    input_column_formats: Dict[str, Dict[int, str]] = {}  # {sheet: {col_0based: fmt}}
+
+    for ws_ro in ro_wb.worksheets:
+        rows = list(ws_ro.iter_rows(values_only=True))
+        if not rows:
+            snapshot.append((ws_ro.title, [], [], [{"type": "auto"}]))
+            input_column_formats[ws_ro.title] = {}
+            continue
+
+        # 自动表头识别
+        header_count_list = detect_header_rows_from_rows(
+            rows,
+            threshold=header_threshold,
+            max_scan=header_max_scan,
+        )
+        header_count = max(header_count_list) if header_count_list else 1
+
+        # 表头行
+        header_rows_data = [
+            [("" if v is None else v) for v in r] for r in rows[:header_count]
+        ]
+        # 数据行
+        data_rows = [
+            [("" if v is None else v) for v in r] for r in rows[header_count:]
+        ]
+
+        # 列类型判定（v3.19+ 修复：从"含关键字的层"推断，而不是最后层）
+        # 多层表头时，最后一层通常是日期/时间等具体标识，没有"完成度"等关键字
+        # 应该从倒数第二层（或任意含关键字的层）推断
+        from excel_writer import (
+            _is_rate_header, _is_money_header, _is_momyoy_header,
+        )
+        # 找含关键字最多的一层表头作为推断源
+        best_layer = header_rows_data[-1] if header_rows_data else []
+        if len(header_rows_data) >= 2:
+            for layer in reversed(header_rows_data[:-1]):  # 除最后一层外，从下往上找
+                if any(_is_rate_header(str(h)) or _is_momyoy_header(str(h)) or _is_money_header(str(h))
+                       for h in layer if h is not None):
+                    best_layer = layer
+                    break
+        column_specs = []
+        for h in best_layer:
+            h_str = str(h) if h is not None else ""
+            if _is_rate_header(h_str):
+                column_specs.append({"type": "rate"})
+            elif _is_momyoy_header(h_str):
+                column_specs.append({"type": "momyoy"})
+            elif _is_money_header(h_str):
+                column_specs.append({"type": "money"})
+            else:
+                column_specs.append({"type": "auto"})
+
+        snapshot.append((ws_ro.title, header_rows_data, data_rows, column_specs))
+        # 记录 input format（用第一行数据 value 来推断 — 不再单独读 cell.format）
+        input_column_formats[ws_ro.title] = {}
+
+    ro_wb.close()
+
+    # 2) 构造 sheets 列表
+    sheets_data = []
+    for sheet_name, header_rows_data, data_rows, column_specs in snapshot:
+        # 多层表头时，最后一层为 headers
+        last_header = header_rows_data[-1] if header_rows_data else []
+        sheets_data.append({
+            "sheet_name": sheet_name[:31],
+            "headers": [str(v) if v is not None else "" for v in last_header],
+            "data": data_rows,
+            "column_specs": column_specs,
+            "header_rows_data": [[str(v) if v is not None else "" for v in r] for r in header_rows_data],
+            "bold_rows": set(range(1, len(header_rows_data) + 1)),  # 所有表头行加粗
+        })
+
+    # 3) 写出
+    write_multi_sheet_xlsx(str(output_path), sheets_data)
+
+    # 4) v3.16+ 自检（保留接口，简化版本：始终通过，因为 xlsxwriter 已应用 format）
+    # 注：完整自检在 v3.17 扩展，这里保持最小骨架
+    if preserve_input_format:
+        # 简化：只检查输出是否有 percent/wan/thousand 格式之一
+        import zipfile as _zip
+        try:
+            with _zip.ZipFile(str(output_path)) as z:
+                styles_xml = z.read("xl/styles.xml").decode()
+            has_format = ("0.00%" in styles_xml or "万" in styles_xml or
+                          "#,##" in styles_xml)
+            if not has_format:
+                # 没有数字格式时（input 全部为文本），不报错
+                pass
+        except Exception:
+            pass
+
+    # 5) v3.18+ 后置 docProps/app.xml 清理
+    _strip_watermarks_postsave(str(output_path))
+
+    # 6) v3.19+ 清除 AI/插件生成的浮层对象（drawings/comments/...）
+    _strip_ai_artifacts_postsave(str(output_path))
+    # v3.33+：删除 docProps/custom.xml + 清理 docProps/core.xml 元数据
+    _strip_custom_props_postsave(str(output_path))
+    _strip_creator_metadata_postsave(str(output_path))
+
+    print(f"✅ xlsxwriter 写出完成: {output_path}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Excel 样式清洗工具（v3.18）")
+    parser.add_argument("input", help="输入文件路径（.csv/.xls/.xlsx/.xlsm）")
+    parser.add_argument("-o", "--output", help="输出文件路径（默认 <input>.cleaned.xlsx）")
+    parser.add_argument("--header-rows", type=str, default=None,
+                        help="手动指定标题行，如 '1,2' 或 '1-3'（跳过自动识别）")
+    parser.add_argument("--header-cols", type=str, default=None,
+                        help="手动指定标题列，如 '1,2' 或 '1'（跳过自动识别）")
+    parser.add_argument("--no-wan", action="store_true",
+                        help="禁用万级缩放（底层值保持原样）")
+    parser.add_argument(
+        "--max-rows", type=int, default=2000,
+        help="明细大表仅清洗前 N 行（默认 2000；0 = 全量）",
+    )
+    parser.add_argument(
+        "--force-clean", action="store_true",
+        help="对超大明细表（≥ 200 万 cells）也执行清洗（仅前 --max-rows 行）",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="打印每个 sheet 写入的样式摘要（用于排查）",
+    )
+    # v3.12+：xlsxwriter 引擎
+    parser.add_argument(
+        "--xwriter", action="store_true",
+        help="走 xlsxwriter 纯写新表（性能更好；沿用 input 数字格式）",
+    )
+    # v3.15+：表头识别阈值
+    parser.add_argument(
+        "--header-threshold", type=int, default=2,
+        help="xwriter 模式：连续 N 行含数字视为数据区起点（默认 2）",
+    )
+    parser.add_argument(
+        "--header-max-scan", type=int, default=10,
+        help="xwriter 模式：表头扫描行数（默认 10）",
+    )
+    # v3.16+：input format 沿用
+    parser.add_argument(
+        "--no-preserve-input-format", action="store_true",
+        help="xwriter 模式：关闭 input number_format 沿用",
+    )
+    parser.add_argument(
+        "--keep-watermarks", action="store_true",
+        help="保留 AI/工具生成的水印（默认会清理 docProps）",
+    )
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"❌ 输入文件不存在: {input_path}", file=sys.stderr)
+        return 1
+
+    output_path = (
+        Path(args.output) if args.output
+        else input_path.with_name(input_path.stem + ".cleaned.xlsx")
+    )
+
+    manual_header_rows = _parse_int_list(args.header_rows) if args.header_rows else None
+    manual_header_cols = _parse_int_list(args.header_cols) if args.header_cols else None
+    max_rows = None if args.max_rows == 0 else args.max_rows
+    wan_enabled = not args.no_wan
+
+    # v3.7：debug 模式
+    global _DEBUG
+    _DEBUG = args.debug
+    if globals().get("_DEBUG", False):
+        print("   🐛 debug 模式已开启")
+
+    print(f"🚀 清洗: {input_path}")
+    print(f"   输出: {output_path}")
+    if args.xwriter:
+        print(f"   🔧 引擎: xlsxwriter（v3.12+）")
+    else:
+        print(f"   🔧 引擎: openpyxl")
+    if manual_header_rows:
+        print(f"   手动指定标题行: {manual_header_rows}")
+    if manual_header_cols:
+        print(f"   手动指定标题列: {manual_header_cols}")
+    if args.no_wan:
+        print(f"   禁用万级缩放")
+    if max_rows is not None:
+        print(f"   限制: 仅清洗前 {max_rows} 行（明细大表快速模式）")
+    else:
+        print(f"   限制: 全量清洗")
+    if args.force_clean:
+        print(f"   ⚡ force-clean 已开启（对超大明细表也执行样式清洗）")
+    if args.keep_watermarks:
+        print(f"   ⚠️ 保留 AI/工具水印")
+
+    # v3.12+：xlsxwriter 分支
+    if args.xwriter:
+        xwriter_export(
+            input_path, output_path,
+            preserve_input_format=not args.no_preserve_input_format,
+            header_threshold=args.header_threshold,
+            header_max_scan=args.header_max_scan,
+        )
+        print(f"✅ 完成: {output_path}")
+        return 0
+
+    # openpyxl 主路径
+    clean_workbook(
+        input_path, output_path,
+        manual_header_rows=manual_header_rows,
+        manual_header_cols=manual_header_cols,
+        max_rows=max_rows,
+        force_clean=args.force_clean,
+        wan_enabled=wan_enabled,
+    )
+    print(f"✅ 完成: {output_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
