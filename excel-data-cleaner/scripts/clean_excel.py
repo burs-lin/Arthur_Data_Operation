@@ -103,7 +103,7 @@ DEFAULT_RULES: Dict[str, Any] = {
                 "gmv",  # GMV (Gross Merchandise Volume) 视为金额类
                 "手续费",  # 提成核算净手续费 等
                 "调整金额", "成本", "利润",
-                "余额", "balance",  # 截至该笔付款前CNH余额 / 账户余额 / 可用余额
+                "余额", "balance",  # 账户余额 / 可用余额 / 支付前余额
                 # 更长的复合关键词,优先于 percent 中的"比例"
                 "比例费金额",
             ],

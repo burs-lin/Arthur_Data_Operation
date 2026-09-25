@@ -6,13 +6,13 @@
   - 所有 cell(包括空 cell)→ border
 """
 import sys
-sys.path.insert(0, r"D:\Trae_Work\Data_Operation\.agents\skills\excel-data-cleaner\scripts")
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from openpyxl import Workbook, load_workbook
 import clean_excel as cec
 
 
-TMP = Path(r"D:\Trae_Work\Data_Operation\.agents\skills\excel-data-cleaner\tests\_tmp")
+TMP = Path(__file__).resolve().parent / "_tmp"
 TMP.mkdir(exist_ok=True)
 
 

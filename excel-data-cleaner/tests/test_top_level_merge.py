@@ -8,13 +8,13 @@
   - 不生成 _CLEAN_REPORT / _ANOMALIES sheet
 """
 import sys
-sys.path.insert(0, r"D:/Trae_Work/Data_Operation/.agents/skills/excel-data-cleaner/scripts")
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from openpyxl import Workbook, load_workbook
 import clean_excel as cec
 
 
-TMP = Path(r"D:/Trae_Work/Data_Operation/.agents/skills/excel-data-cleaner/tests/_tmp")
+TMP = Path(__file__).resolve().parent / "_tmp"
 TMP.mkdir(exist_ok=True)
 
 
@@ -81,7 +81,7 @@ def test_multi_header_top_level():
     make_xlsx(src, [
         ["销售报表", None, None, None, None, None, None, None],   # R1 顶层合并
         ["区域", None, "客户", None, "业务", None, None, None],   # R2 部分相邻空
-        ["华北", "北京店", "张三", "VIP001号", "B2B", "贸易", "货贸", "付款"],
+        ["华北", "北京店", "张三", "M0001号", "B2B", "贸易", "货贸", "付款"],
     ])
     out = TMP / "multi_out.xlsx"
     cec.clean_file(str(src), output_path=str(out))

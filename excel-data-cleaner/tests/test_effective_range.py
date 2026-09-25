@@ -7,8 +7,8 @@
   - 行高自适应(列宽换行后的行数估算)
 """
 import sys
-sys.path.insert(0, r"D:/Trae_Work/Data_Operation/.agents/skills/excel-data-cleaner/scripts")
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from openpyxl import Workbook, load_workbook
 import clean_excel as cec
 
@@ -103,7 +103,7 @@ def test_row_height_long_content():
 
 def test_row_height_via_e2e():
     """端到端:clean_file 后行高被设置"""
-    src = Path(r"D:/Trae_Work/Data_Operation/.agents/skills/excel-data-cleaner/tests/_tmp/t_rh.xlsx")
+    src = Path(__file__).resolve().parent / "_tmp" / 't_rh.xlsx'
     src.parent.mkdir(exist_ok=True)
     wb = Workbook()
     ws = wb.active

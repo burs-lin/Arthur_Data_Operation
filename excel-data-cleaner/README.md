@@ -334,3 +334,11 @@ pip install pandas openpyxl xlrd pyyaml xlsxwriter
 ## 许可
 
 [MIT License](LICENSE) — 自由使用、修改、分发，请保留版权声明。
+
+---
+
+## 微信公众号
+
+使用中遇到 bug 或有疑问，可扫描下方二维码在公众号后台留言，作者会定期回复：
+
+![微信公众号二维码](assets/wechat-qr.jpg)
